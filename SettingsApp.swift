@@ -1,0 +1,245 @@
+import SwiftUI
+import AppKit
+
+struct Preferences: Codable, Equatable {
+    var refresh_minutes = 5
+    var window = "primary"
+    var display = "remaining"
+    var show_tokens = true
+    var show_countdown = true
+    var label_size = 7
+    var value_size = 12
+    var weight = "regular"
+    var width = 30
+    var value_offset = 0
+    var stale_minutes = 15
+    var low_quota_warning = false
+    var low_quota_threshold = 20
+}
+
+@MainActor final class SettingsStore: ObservableObject {
+    @Published var draft = Preferences()
+    @Published var saved = Preferences()
+    @Published var busy = false
+    @Published private(set) var availableWindows: Set<String> = ["primary", "secondary"]
+    @Published private(set) var availabilityKnown = false
+    @Published var message = ""
+    @Published var failed = false
+    let support = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CodexUsage")
+
+    init() {
+        let url = support.appendingPathComponent("settings.json")
+        if FileManager.default.fileExists(atPath: url.path) {
+            do {
+                let defaults = try JSONSerialization.jsonObject(with: JSONEncoder().encode(Preferences())) as! [String: Any]
+                let stored = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any] ?? [:]
+                let merged = defaults.merging(stored) { _, savedValue in savedValue }
+                draft = try JSONDecoder().decode(Preferences.self, from: JSONSerialization.data(withJSONObject: merged))
+                saved = draft
+            } catch {
+                message = "无法读取设置，当前显示默认值。保存后可恢复。"
+                failed = true
+            }
+        }
+        Task { await refreshAvailability() }
+    }
+
+    func canSelect(_ window: String) -> Bool { availableWindows.contains(window) }
+
+    func refreshAvailability() async {
+        let script = support.appendingPathComponent("codex_usage.py").path
+        let result: Set<String>? = await Task.detached {
+            do {
+                let process = Process(), output = Pipe()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+                process.arguments = [script, "--available-windows"]
+                process.standardOutput = output
+                try process.run()
+                process.waitUntilExit()
+                guard process.terminationStatus == 0,
+                      let values = try JSONSerialization.jsonObject(with: output.fileHandleForReading.readDataToEndOfFile()) as? [String: Bool]
+                else { return nil }
+                return Set(values.compactMap { $0.value ? $0.key : nil })
+            } catch { return nil }
+        }.value
+        guard let result else { return }
+        availabilityKnown = true
+        availableWindows = result
+        guard !result.isEmpty, !result.contains(draft.window) else { return }
+        draft.window = result.contains("primary") ? "primary" : "secondary"
+        message = "所选额度暂无数据，已切换为\(draft.window == "primary" ? "5 小时" : "每周")；请保存"
+    }
+
+    func refresh() {
+        let opened = NSWorkspace.shared.open(URL(string: "swiftbar://refreshallplugins")!)
+        failed = !opened
+        message = opened ? "已请求查询最新额度；查询结果将在菜单中更新" : "无法打开 SwiftBar，请确认已安装并运行"
+    }
+
+    func save() {
+        let proposed = draft
+        let script = support.appendingPathComponent("codex_usage.py").path
+        busy = true
+        message = "正在应用…"
+        failed = false
+        Task {
+            let errorText: String? = await Task.detached {
+                do {
+                    let process = Process()
+                    let input = Pipe(), output = Pipe(), errors = Pipe()
+                    process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+                    process.arguments = [script, "--apply-settings"]
+                    process.standardInput = input
+                    process.standardOutput = output
+                    process.standardError = errors
+                    try process.run()
+                    input.fileHandleForWriting.write(try JSONEncoder().encode(proposed))
+                    try input.fileHandleForWriting.close()
+                    process.waitUntilExit()
+                    if process.terminationStatus != 0 {
+                        let detail = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                        return "保存失败，请检查插件目录是否可写。\n" + String(detail.suffix(240))
+                    }
+                    return nil
+                } catch { return "保存失败：\(error.localizedDescription)" }
+            }.value
+            busy = false
+            if let errorText {
+                message = errorText
+                failed = true
+            } else {
+                saved = proposed
+                message = "已应用 · 每 \(proposed.refresh_minutes) 分钟刷新"
+            }
+        }
+    }
+}
+
+struct SettingsView: View {
+    @StateObject private var store = SettingsStore()
+    private var valueWeight: Font.Weight {
+        store.draft.weight == "semibold" ? .semibold : store.draft.weight == "medium" ? .medium : .regular
+    }
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 16) {
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("Codex").font(.system(size: CGFloat(store.draft.label_size), weight: .light))
+                    Text(store.draft.display == "remaining" ? "82%" : "18%")
+                        .font(.system(size: CGFloat(store.draft.value_size), weight: valueWeight))
+                        .offset(y: -CGFloat(store.draft.value_offset))
+                }
+                .frame(width: CGFloat(store.draft.width), height: 22)
+                .foregroundStyle(.white)
+                .padding(14)
+                .background(Color.black, in: RoundedRectangle(cornerRadius: 12))
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Codex 用量设置").font(.title2.weight(.semibold))
+                    Text("预览为示例数据，保存后应用到菜单栏").font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+            }.padding(24)
+
+            TabView {
+                generalSettings.tabItem { Label("常用", systemImage: "slider.horizontal.3") }
+                appearanceSettings.tabItem { Label("外观", systemImage: "textformat.size") }
+            }
+            .padding(.horizontal, 16)
+            .disabled(store.busy)
+            Divider()
+            HStack {
+                Button("恢复默认") { store.draft = Preferences(); store.message = "默认值已填入，点击保存以应用" }
+                Spacer()
+                Button("撤销更改") { store.draft = store.saved; store.message = "" }
+                    .disabled(store.draft == store.saved)
+                Button("保存并应用") { store.save() }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(store.draft == store.saved)
+            }.disabled(store.busy).padding([.horizontal, .top], 20)
+            Text(store.message.isEmpty ? (store.draft == store.saved ? "设置仅保存在这台 Mac 上" : "有未保存的更改") : store.message)
+                .font(.caption).foregroundStyle(store.failed ? Color.red : Color.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 20).padding(.vertical, 12)
+        }.frame(width: 550, height: 760)
+        .onChange(of: store.draft) { _ in store.message = ""; store.failed = false }
+    }
+
+    private var generalSettings: some View {
+        Form {
+                Section {
+                    Picker("刷新间隔", selection: $store.draft.refresh_minutes) {
+                        ForEach([1, 2, 5, 10, 15, 30], id: \.self) { minute in
+                            Text("每 \(minute) 分钟" + (minute == 5 ? "（默认）" : "")).tag(minute)
+                        }
+                    }
+                    Text("主动查询账户额度；查询失败时回退到本机日志并标注。今日 tokens 为本机估算。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        Button("立即查询额度") { store.refresh() }
+                        Spacer()
+                        Link("打开官方用量页面", destination: URL(string: "https://chatgpt.com/codex/settings/usage")!)
+                    }
+                } header: { Text("刷新") }
+                Section {
+                    Picker("菜单栏主数字", selection: Binding(
+                        get: { store.draft.window },
+                        set: { selected in
+                            if store.canSelect(selected) { store.draft.window = selected }
+                        }
+                    )) {
+                        Text(store.canSelect("primary") ? "5 小时额度" : "5 小时额度（暂无数据）")
+                            .tag("primary").disabled(!store.canSelect("primary"))
+                        Text(store.canSelect("secondary") ? "每周" : "每周（暂无数据）")
+                            .tag("secondary").disabled(!store.canSelect("secondary"))
+                    }
+                    Text(store.availabilityKnown && store.availableWindows.isEmpty
+                         ? "当前查询与本机记录均未提供可用额度，暂不能选择。"
+                         : "下拉菜单始终同时显示 5 小时和每周额度；暂无数据的选项不可选择。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Picker("数字含义", selection: $store.draft.display) {
+                        Text("剩余百分比").tag("remaining")
+                        Text("已用百分比").tag("used")
+                    }
+                    Toggle("显示今日 tokens", isOn: $store.draft.show_tokens)
+                    Toggle("显示重置倒计时", isOn: $store.draft.show_countdown)
+                } header: { Text("用量显示") }
+                Section {
+                    Toggle("菜单内低额度提示", isOn: $store.draft.low_quota_warning)
+                    if store.draft.low_quota_warning {
+                        Picker("剩余不超过", selection: $store.draft.low_quota_threshold) {
+                            ForEach([10, 20, 30], id: \.self) { value in Text("\(value)%").tag(value) }
+                        }
+                    }
+                    Picker("额度记录过时提醒", selection: $store.draft.stale_minutes) {
+                        ForEach([15, 30, 60, 120], id: \.self) { minute in Text("超过 \(minute) 分钟").tag(minute) }
+                    }
+                    Text("低额度提示检查两个窗口，仅在数据未过时时显示；过时以额度记录时间计算。")
+                        .font(.caption).foregroundStyle(.secondary)
+                } header: { Text("提醒") }
+        }.formStyle(.grouped)
+    }
+
+    private var appearanceSettings: some View {
+        Form {
+                Section {
+                    Stepper("标签字号：\(store.draft.label_size) pt", value: $store.draft.label_size, in: 6...10)
+                    Stepper("数字字号：\(store.draft.value_size) pt", value: $store.draft.value_size, in: 10...15)
+                    Picker("数字字重", selection: $store.draft.weight) {
+                        Text("常规 Regular").tag("regular")
+                        Text("中等 Medium").tag("medium")
+                        Text("半粗 Semibold").tag("semibold")
+                    }
+                    Stepper("组件宽度：\(store.draft.width) pt", value: $store.draft.width, in: 30...44)
+                    Stepper("数字向上偏移：\(store.draft.value_offset) pt", value: $store.draft.value_offset, in: -2...2)
+                } header: { Text("菜单栏外观") }
+        }.formStyle(.grouped)
+    }
+}
+
+@main struct CodexUsageSettingsApp: App {
+    var body: some Scene {
+        Window("Codex 用量设置", id: "settings") {
+            SettingsView().onAppear { NSApp.activate(ignoringOtherApps: true) }
+        }.windowResizability(.contentSize)
+    }
+}
