@@ -3,7 +3,9 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
+import codex_usage
 from codex_usage import collect, summary, window_text, countdown, quota_windows, available_windows, ui_model
 
 
@@ -142,6 +144,20 @@ class UsageTests(unittest.TestCase):
         model = ui_model(data)
         self.assertEqual(model['tokens']['label'], '10-24')
         self.assertEqual(model['tokens']['text'], '13.6M')
+
+    def test_account_api_skips_the_full_local_scan(self):
+        calls = {}
+        def fake_collect(home, now, tail_only=False):
+            calls['tail_only'] = tail_only
+            return {'latest': None, 'today': {'total_tokens': 0}, 'history': [], 'skipped_files': 0}
+        with patch.object(codex_usage, 'collect', side_effect=fake_collect), \
+             patch.object(codex_usage.quota_api, 'query', return_value={'timestamp': 1, 'limits': {}}), \
+             patch.object(codex_usage.quota_api, 'query_usage',
+                          return_value={dt.datetime.now().strftime('%Y-%m-%d'): 100}):
+            data = codex_usage.collect_usage(Path('.'))
+        self.assertTrue(calls['tail_only'])
+        self.assertEqual(data['tokens_source'], '账户 API')
+        self.assertEqual(data['history'][-1]['tokens'], 100)
 
 
 if __name__ == '__main__':

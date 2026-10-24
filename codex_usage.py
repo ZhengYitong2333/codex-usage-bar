@@ -23,7 +23,30 @@ def number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def collect(home, now):
+def read_tail(path, size=262144):
+    """The last chunk of a rollout file; enough to find its newest events."""
+    try:
+        with path.open('rb') as stream:
+            stream.seek(0, os.SEEK_END)
+            length = stream.tell()
+            stream.seek(max(0, length - size))
+            data = stream.read()
+    except OSError:
+        return None
+    if length > size:
+        # Drop the partial first line the seek may have landed inside.
+        cut = data.find(b'\n')
+        if cut >= 0:
+            data = data[cut + 1:]
+    return data.splitlines()
+
+
+def collect(home, now, tail_only=False):
+    """Scan the local rollouts.
+
+    `tail_only` reads only the end of each file, which is enough to find the
+    newest quota snapshot but not to rebuild the daily token history.
+    """
     today = dt.datetime.fromtimestamp(now).date()
     days = [today - dt.timedelta(days=offset) for offset in range(6, -1, -1)]
     keys = ('input_tokens', 'cached_input_tokens', 'output_tokens', 'total_tokens')
@@ -39,8 +62,14 @@ def collect(home, now):
             seen.add(path.name)
             previous = None
             try:
-                with path.open('rb') as stream:
-                    for line in stream:
+                if tail_only:
+                    lines = read_tail(path)
+                    if lines is None:
+                        raise OSError(path)
+                else:
+                    with path.open('rb') as stream:
+                        lines = list(stream)
+                for line in lines:
                         if b'"token_count"' not in line:
                             continue
                         try:
@@ -92,11 +121,14 @@ def collect(home, now):
 
 def collect_usage(home, local_only=False):
     now = dt.datetime.now().timestamp()
-    data = collect(home, now)
+    data = {'latest': None, 'today': dict.fromkeys(
+        ('input_tokens', 'cached_input_tokens', 'output_tokens', 'total_tokens'), 0),
+        'history': [], 'skipped_files': 0, 'refreshed_at': now}
     data['scanned_at'] = now
     data['quota_source'] = 'log'
     data['tokens_source'] = '本机统计'
     data['query_enabled'] = not local_only
+    account = False
     if not local_only:
         try:
             data['latest'] = quota_api.query(home)
@@ -112,8 +144,19 @@ def collect_usage(home, local_only=False):
                 data.update(account_tokens(daily, now))
                 data['tokens_source'] = '账户 API'
                 data['tokens_note'] = '账户 token 活动口径，按接口日期展示；未返回的日期显示待同步，接口不提供输入/输出拆分。'
+                account = True
             except (quota_api.QuotaQueryError, ValueError):
                 data['tokens_note'] = '账户 token 接口暂不可用，已回退到本机日志估算。'
+    # The account API covers the token history, so the local rollouts only have
+    # to provide the quota fallback; that does not need a full scan.
+    local = collect(home, now, tail_only=account)
+    if not account:
+        data['today'] = local.get('today', data['today'])
+        data['history'] = local.get('history', [])
+    data['skipped_files'] = local.get('skipped_files', 0)
+    if data['latest'] is None:
+        data['latest'] = local.get('latest')
+    if not local_only:
         data['queried_at'] = dt.datetime.now().timestamp()
         data['refreshed_at'] = data['queried_at']
     return data
