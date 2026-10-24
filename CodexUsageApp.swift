@@ -497,8 +497,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let size = NSSize(width: 320, height: 190)
         let visible = (popoverWindow.screen ?? NSScreen.main)?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let x = min(popoverWindow.frame.maxX - 18, visible.maxX - size.width)
-        let panelTop = popoverWindow.frame.maxY - 160
+        // Sit next to the sparkline, never on top of it: a panel that covers
+        // the trigger ends the hover the moment it appears.
+        let gap: CGFloat = 8
+        var x = popoverWindow.frame.maxX + gap
+        if x + size.width > visible.maxX {
+            x = popoverWindow.frame.minX - gap - size.width
+        }
+        x = max(visible.minX + 8, min(x, visible.maxX - size.width))
+        let panelTop = popoverWindow.frame.maxY - 150
         var y = panelTop - size.height
         y = max(y, visible.minY + 8)
         let finalFrame = NSRect(origin: NSPoint(x: x, y: y), size: size)
