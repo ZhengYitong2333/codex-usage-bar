@@ -31,12 +31,13 @@
 | 网络临时不通？ | 回退到本机日志，并明确显示查询失败。 |
 | 没有 5 小时窗口？ | 显示“未提供”，不补造数据、不拼接旧快照。 |
 | 想调得顺手？ | 原生 SwiftUI 设置，调整刷新周期、显示窗口、字号和提醒。 |
+| 还用 OpenCode？ | Codex 卡片下方堆叠 OpenCode 卡片，展示 Go 的滚动/每周/每月额度与近 7 日统计。 |
 
 菜单栏采用两行紧凑图形：上方 `Codex`，下方为当前窗口的百分比；悬停可查看窗口说明。窗口不可用时自动切换到另一个有数据的窗口。点开后是原生毛玻璃弹层，进度条以灰色渐变呈现，并在打开时播放增长动画。
 
 ## 快速开始
 
-需要 **macOS 13+**、已登录 ChatGPT 账号的 [Codex CLI](https://learn.chatgpt.com/docs/cli)，以及 Xcode Command Line Tools 提供的 `swiftc` 和 `/usr/bin/python3`。不再依赖 SwiftBar。
+需要 **macOS 13+**、已登录 ChatGPT 账号的 [Codex CLI](https://learn.chatgpt.com/docs/cli)，以及 Xcode Command Line Tools 提供的 `swiftc` 和 `/usr/bin/python3`。不再依赖 SwiftBar。OpenCode 支持是可选的：安装 [OpenCode CLI](https://opencode.ai) 后会自动显示；Go/Console 额度还需要在 OpenCode 中登录。
 
 ```bash
 xcode-select --install
@@ -59,6 +60,7 @@ cd codex-usage-bar
 **首次运行会连什么**
 
 - **Codex**：自动连接。它复用已安装 Codex CLI 的登录状态，直接读取订阅额度；未登录时回退到本机日志。只有 API Key 的登录方式不适用于订阅额度查询。
+- **OpenCode**：自动连接本地服务（首次会由 `opencode stats` 拉起 OpenCode 后台服务），读取本机统计。Go / Console 额度需要一次交互式登录，卡片上的“登录”按钮会打开终端执行 `opencode auth login`。
 - 安装脚本本身不联网、不登录、不上传任何数据。
 
 ## 数据从哪里来
@@ -70,13 +72,18 @@ Codex 已有登录
 codex app-server · stdio
       │ account/rateLimits/read
       ▼
-当前额度快照 ─────────────► 原生菜单栏弹层
-      ▲                       ▲
-      │ 接口失败时回退          │ 今日 tokens：本机估算
-      └────── 本机会话日志 ─────┘
+当前额度快照 ─────────────► 原生菜单栏弹层 ◄── OpenCode 本地服务
+      ▲                       ▲                    │
+      │ 接口失败时回退          │ 今日 tokens：本机估算  │ Go/Console 额度
+      └────── 本机会话日志 ─────┘                    │
+                                          opencode stats --json
 ```
 
 **额度**通过 Codex App Server 的 [`account/rateLimits/read`](https://learn.chatgpt.com/docs/app-server#6-rate-limits-chatgpt) 主动获取，复用 Codex 的登录管理。本工具不自行读取或保存登录令牌，不创建对话，不调用模型生成任务。
+
+**OpenCode** 通过 `opencode stats --json` 读取本地统计。Go/Console 额度优先走 OpenCode 本地服务的 `/api/experimental/usage/limits`；较旧的 OpenCode 没有这个接口，此时直接调用 OpenCode Console 的 `/zen/go/v1/usage` 与 `/api/policies/current-budgets`。
+
+这两种方式都复用 OpenCode 自己的登录状态：本地服务把地址和一次性服务密码写在 `~/.local/state/opencode/service.json`，Console 请求则使用 OpenCode 存储在 `~/.local/share/opencode/opencode.db` 里的账号凭据（Go 读取 `opencode-go`，Console 读取 `opencode`）。Go Key 仅用于 Go 额度查询，不用于 Console 预算接口；查询失败会显示错误，不再误报未登录。凭据只在内存中用于填充请求头，不复制、不落盘、不打印，也不会写进本工具的配置。
 
 **窗口**按实际时长识别：300 分钟对应 5 小时，10080 分钟对应每周。接口中的 `primary` 与 `secondary` 不固定对应某个时长；账户没有返回的窗口保持“未提供”。
 
@@ -121,11 +128,13 @@ python3 script/check_privacy.py
 python3 codex_usage.py                     # 终端可读摘要
 python3 codex_usage.py --json              # 原始统计
 python3 codex_usage.py --ui-json           # 菜单栏应用使用的视图模型
+python3 codex_usage.py --opencode-json     # OpenCode 额度与统计
 python3 codex_usage.py --local-only --json # 只读本机日志
 ```
 
 ```text
 codex_usage.py         日志统计、接口与视图模型的整合
+opencode_usage.py      OpenCode stats 与 Go/Console 额度读取
 quota_api.py           App Server 初始化、额度读取与归一化
 settings.py           设置校验与持久化
 CodexUsageApp.swift    原生菜单栏应用（毛玻璃弹层、动画进度条）

@@ -17,6 +17,15 @@ struct Preferences: Codable, Equatable {
     var low_quota_threshold = 20
     var show_codex = true
     var show_opencode = true
+    var opencode_display = "remaining"
+    var opencode_days = 7
+    var opencode_show_go = true
+    var opencode_show_rolling = true
+    var opencode_show_weekly = true
+    var opencode_show_monthly = true
+    var opencode_show_stats = true
+    var opencode_show_cost = true
+    var opencode_cli = ""
 }
 
 @MainActor final class SettingsStore: ObservableObject {
@@ -149,6 +158,7 @@ struct SettingsView: View {
 
             TabView {
                 codexSettings.tabItem { Label("Codex", systemImage: "terminal") }
+                openCodeSettings.tabItem { Label("OpenCode", systemImage: "curlybraces") }
                 generalSettings.tabItem { Label("通用", systemImage: "slider.horizontal.3") }
                 appearanceSettings.tabItem { Label("外观", systemImage: "textformat.size") }
             }
@@ -235,6 +245,47 @@ struct SettingsView: View {
                 Text("低额度提示检查两个窗口，仅在数据未过时时显示；过时以额度记录时间计算。")
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("提醒") }
+        }.formStyle(.grouped)
+    }
+
+    private var openCodeSettings: some View {
+        Form {
+            Section {
+                Toggle("显示 OpenCode 卡片", isOn: openCodeVisible)
+                Picker("数字含义", selection: $store.draft.opencode_display) {
+                    Text("剩余百分比").tag("remaining")
+                    Text("已用百分比").tag("used")
+                }
+                Picker("统计天数", selection: $store.draft.opencode_days) {
+                    Text("近 7 日").tag(7)
+                    Text("近 30 日").tag(30)
+                }
+                Text("OpenCode 需要安装 opencode CLI；至少保留一张卡片。")
+                    .font(.caption).foregroundStyle(.secondary)
+            } header: { Text("OpenCode 卡片") }
+            Section {
+                Toggle("显示 Go 额度", isOn: $store.draft.opencode_show_go)
+                Toggle("滚动额度", isOn: $store.draft.opencode_show_rolling)
+                    .disabled(!store.draft.opencode_show_go)
+                Toggle("每周额度", isOn: $store.draft.opencode_show_weekly)
+                    .disabled(!store.draft.opencode_show_go)
+                Toggle("每月额度", isOn: $store.draft.opencode_show_monthly)
+                    .disabled(!store.draft.opencode_show_go)
+                Text("Go 额度从 OpenCode 本地服务读取，需要 OpenCode 已登录。")
+                    .font(.caption).foregroundStyle(.secondary)
+            } header: { Text("Go 额度") }
+            Section {
+                Toggle("显示本地统计", isOn: $store.draft.opencode_show_stats)
+                Toggle("显示费用", isOn: $store.draft.opencode_show_cost)
+                    .disabled(!store.draft.opencode_show_stats)
+                Text("统计来自 opencode stats：tokens、费用、会话数和活跃天数。")
+                    .font(.caption).foregroundStyle(.secondary)
+            } header: { Text("本地统计") }
+            Section {
+                TextField("CLI 路径", text: $store.draft.opencode_cli, prompt: Text("留空自动探测"))
+                Text("自动查找 PATH、nvm、Homebrew 等位置的 opencode。")
+                    .font(.caption).foregroundStyle(.secondary)
+            } header: { Text("OpenCode CLI") }
         }.formStyle(.grouped)
     }
 

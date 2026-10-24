@@ -340,6 +340,7 @@ def main():
     parser.add_argument('--get-settings', action='store_true')
     parser.add_argument('--save-settings', action='store_true')
     parser.add_argument('--ui-json', action='store_true')
+    parser.add_argument('--opencode-json', action='store_true')
     parser.add_argument('--available-windows', action='store_true')
     parser.add_argument('--local-only', action='store_true', help='只读取本机日志，不查询额度接口')
     args = parser.parse_args()
@@ -348,6 +349,23 @@ def main():
         return
     if args.save_settings:
         result = preferences.save(json.load(sys.stdin))
+        print(json.dumps(result, ensure_ascii=False))
+        return
+    if args.opencode_json:
+        import opencode_usage
+        try:
+            settings = preferences.read()
+            result = opencode_usage.query(
+                days=settings['opencode_days'], display=settings['opencode_display'],
+                cli=settings['opencode_cli'] or None,
+                show_go=settings['opencode_show_go'],
+                show_rolling=settings['opencode_show_rolling'],
+                show_weekly=settings['opencode_show_weekly'],
+                show_monthly=settings['opencode_show_monthly'],
+                show_stats=settings['opencode_show_stats'],
+                show_cost=settings['opencode_show_cost'])
+        except opencode_usage.OpenCodeError as error:
+            result = opencode_usage.empty(str(error))
         print(json.dumps(result, ensure_ascii=False))
         return
     if args.available_windows:

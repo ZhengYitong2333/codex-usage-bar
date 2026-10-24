@@ -10,7 +10,12 @@ DEFAULTS = dict(refresh_minutes=5, window='primary', display='remaining',
                 show_tokens=True, show_countdown=True, label_size=7,
                 value_size=12, weight='regular', width=30, value_offset=0,
                 stale_minutes=15, low_quota_warning=False, low_quota_threshold=20,
-                show_codex=True, show_opencode=True)
+                show_codex=True, show_opencode=True,
+                opencode_display='remaining', opencode_days=7,
+                opencode_show_go=True, opencode_show_rolling=True,
+                opencode_show_weekly=True, opencode_show_monthly=True,
+                opencode_show_stats=True, opencode_show_cost=True,
+                opencode_cli='')
 INTERVALS = (1, 2, 5, 10, 15, 30)
 
 
@@ -23,15 +28,20 @@ def validate(raw):
             result[key] = raw[key]
     for key, choices in dict(refresh_minutes=INTERVALS, window=('primary', 'secondary'),
                              display=('remaining', 'used'), weight=('regular', 'medium', 'semibold'),
-                             stale_minutes=(15, 30, 60, 120), low_quota_threshold=(10, 20, 30)).items():
+                             stale_minutes=(15, 30, 60, 120), low_quota_threshold=(10, 20, 30),
+                             opencode_display=('remaining', 'used'), opencode_days=(7, 30)).items():
         if result[key] not in choices or isinstance(result[key], bool):
             raise ValueError(f'无效设置：{key}')
-    for key in ('show_tokens', 'show_countdown', 'low_quota_warning', 'show_codex', 'show_opencode'):
+    for key in ('show_tokens', 'show_countdown', 'low_quota_warning', 'show_codex', 'show_opencode',
+                'opencode_show_go', 'opencode_show_rolling', 'opencode_show_weekly', 'opencode_show_monthly',
+                'opencode_show_stats', 'opencode_show_cost'):
         if not isinstance(result[key], bool):
             raise ValueError(f'无效设置：{key}')
     for key in ('refresh_minutes', 'stale_minutes', 'low_quota_threshold'):
         if type(result[key]) is not int:
             raise ValueError(f'无效设置：{key}')
+    if not isinstance(result['opencode_cli'], str):
+        raise ValueError('无效设置：opencode_cli')
     for key, low, high in [('label_size', 6, 10), ('value_size', 10, 15), ('width', 30, 44), ('value_offset', -2, 2)]:
         value = result[key]
         if type(value) is not int or not low <= value <= high:

@@ -70,21 +70,107 @@ struct UIModel: Codable, Equatable {
     var icon: Icon?
 }
 
+struct OpenCodeModel: Codable, Equatable {
+    struct Meter: Codable, Equatable, Identifiable {
+        var key: String
+        var label: String
+        var used: Double
+        var remaining: Double
+        var amount: Double
+        var limited: Bool
+        var resetsAt: Double?
+        var resetText: String?
+        var resetClock: String?
+        var id: String { key }
+    }
+
+    struct Budget: Codable, Equatable, Identifiable {
+        var label: String
+        var limit: Double
+        var spent: Double
+        var remaining: Double
+        var percent: Double
+        var resetsAt: Double?
+        var resetText: String?
+        var id: String { label }
+    }
+
+    struct Tokens: Codable, Equatable {
+        var input: Int
+        var output: Int
+        var reasoning: Int
+        var cacheRead: Int
+        var cacheWrite: Int
+    }
+
+    struct Activity: Codable, Equatable, Identifiable {
+        var date: String
+        var steps: Int
+        var level: Int
+        var id: String { date }
+    }
+
+    struct Stats: Codable, Equatable {
+        var tokens: Tokens
+        var total: Int
+        var totalText: String
+        var inputText: String
+        var outputText: String
+        var cost: Double?
+        var sessions: Int
+        var activeDays: Int
+        var streak: Int
+        var activity: [Activity]
+    }
+
+    var available: Bool
+    var reason: String?
+    var days: Int?
+    var display: String?
+    var workspace: String?
+    var usageUrl: String?
+    var goMeters: [Meter]?
+    var budgets: [Budget]?
+    var showGo: Bool?
+    var limitsStatus: String?
+    var stats: Stats?
+    var updated: Double?
+    var error: String?
+}
+
 // MARK: - Data loading
 
 @MainActor
 final class UsageStore: ObservableObject {
     @Published var model: UIModel?
+    @Published var opencode: OpenCodeModel?
     @Published var refreshing = false
+    @Published var opencodeRefreshing = false
     @Published var message: String?
+    @Published var opencodeMessage: String?
     var onModel: ((UIModel?) -> Void)?
 
     private var loading = false
     private var loadingOpenCode = false
     private let script = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/CodexUsage/codex_usage.py")
+    private let settingsFile = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/CodexUsage/settings.json")
+
+    /// The OpenCode CLI path chosen in settings, empty when it is auto-detected.
+    var opencodeCLIPath: String {
+        guard let data = try? Data(contentsOf: settingsFile),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let path = object["opencode_cli"] as? String else { return "" }
+        return path.trimmingCharacters(in: .whitespaces)
+    }
 
     func refresh() {
+        refreshCodex()
+        refreshOpenCode()
+    }
+
+    func refreshCodex() {
         guard !loading else { return }
         loading = true
         refreshing = true
@@ -104,6 +190,48 @@ final class UsageStore: ObservableObject {
                 }
             }
         }
+    }
+
+    func refreshOpenCode() {
+        guard !loadingOpenCode else { return }
+        loadingOpenCode = true
+        opencodeRefreshing = true
+        let script = self.script
+        DispatchQueue.global(qos: .utility).async {
+            let (model, error) = Self.loadOpenCode(script: script)
+            DispatchQueue.main.async {
+                self.loadingOpenCode = false
+                self.opencodeRefreshing = false
+                if let model {
+                    self.opencode = model
+                    self.opencodeMessage = nil
+                } else {
+                    self.opencodeMessage = error
+                }
+            }
+        }
+    }
+
+    private nonisolated static func loadOpenCode(script: URL) -> (OpenCodeModel?, String?) {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = [script.path, "--opencode-json"]
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return (nil, "无法启动 OpenCode 查询")
+        }
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        if let model = try? decoder.decode(OpenCodeModel.self, from: data) {
+            return (model, nil)
+        }
+        return (nil, "OpenCode 查询失败")
     }
 
     private nonisolated static func loadCodex(script: URL) -> (UIModel?, String?) {
@@ -429,6 +557,7 @@ struct PopoverView: View {
 
     var body: some View {
         let showCodex = store.model?.showCodex ?? true
+        let showOpenCode = store.model?.showOpenCode ?? true
         VStack(alignment: .leading, spacing: 12) {
             if showCodex {
                 header
@@ -469,6 +598,10 @@ struct PopoverView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+            }
+            if showOpenCode {
+                if showCodex { hairline }
+                OpenCodeCard(store: store, openID: openID, animateBar: animateBar)
             }
             hairline
             footer
@@ -634,6 +767,240 @@ enum TerminalCommand {
         process.standardError = FileHandle.nullDevice
         try? process.run()
     }
+}
+
+// MARK: - OpenCode card
+
+struct OpenCodeCard: View {
+    @ObservedObject var store: UsageStore
+    let openID: UUID
+    var animateBar = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            header
+            if let model = store.opencode, model.available {
+                quota(model)
+                if let stats = model.stats {
+                    Hairline()
+                    statsView(stats, model: model)
+                }
+            } else if store.opencodeRefreshing && store.opencode == nil {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("正在读取 OpenCode…")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Text(store.opencode?.reason ?? store.opencodeMessage ?? "未检测到 OpenCode")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Text("安装 OpenCode 后自动显示 Go 额度与本地统计")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 6) {
+            Text("OpenCode 额度").font(.system(size: 13.5, weight: .semibold))
+            if store.opencode?.goMeters?.isEmpty == false {
+                Text("GO")
+                    .font(.system(size: 8.5, weight: .bold))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(Color.primary.opacity(0.08)))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if store.opencodeRefreshing {
+                ProgressView().controlSize(.small).scaleEffect(0.7)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func quota(_ model: OpenCodeModel) -> some View {
+        if let meters = model.goMeters, let primary = meters.first {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(primary.label).font(.system(size: 12)).foregroundStyle(.secondary)
+                    Spacer(minLength: 8)
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
+                        Text(model.display == "remaining" ? "剩余" : "已用")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                        Text("\(Int(primary.amount.rounded()))%")
+                            .font(.system(size: 18, weight: .semibold, design: .rounded))
+                            .monospacedDigit()
+                    }
+                }
+                GlassProgressBar(fraction: max(0, min(1, primary.amount / 100)),
+                                 openID: openID, animate: animateBar)
+                    .frame(height: 9)
+                if let reset = primary.resetText {
+                    Text(reset).font(.system(size: 10.5)).foregroundStyle(.tertiary)
+                }
+            }
+            ForEach(Array(meters.dropFirst())) { meter in
+                HStack(spacing: 8) {
+                    Text(meter.label).font(.system(size: 11.5)).foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(model.display == "remaining" ? "剩余" : "已用") \(Int(meter.amount.rounded()))%")
+                        .font(.system(size: 11.5))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if meters.contains(where: \.limited) {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                    Text("Go 额度已用尽，等待重置")
+                }
+                .font(.system(size: 10.5))
+                .foregroundStyle(.orange)
+            }
+        } else if let budgets = model.budgets, let primary = budgets.first {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(primary.label).font(.system(size: 12)).foregroundStyle(.secondary)
+                    Spacer(minLength: 8)
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
+                        Text(model.display == "remaining" ? "剩余" : "已用")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                        Text(dollars(model.display == "remaining" ? primary.remaining : primary.spent))
+                            .font(.system(size: 18, weight: .semibold, design: .rounded))
+                            .monospacedDigit()
+                    }
+                }
+                GlassProgressBar(fraction: budgetFraction(primary, display: model.display),
+                                 openID: openID, animate: animateBar)
+                    .frame(height: 9)
+                if let reset = primary.resetText {
+                    Text(reset).font(.system(size: 10.5)).foregroundStyle(.tertiary)
+                }
+            }
+            ForEach(Array(budgets.dropFirst())) { budget in
+                HStack(spacing: 8) {
+                    Text(budget.label).font(.system(size: 11.5)).foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(model.display == "remaining" ? "剩余" : "已用") "
+                         + dollars(model.display == "remaining" ? budget.remaining : budget.spent))
+                        .font(.system(size: 11.5))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } else if model.showGo == false {
+            EmptyView()
+        } else if model.limitsStatus == "unsupported" {
+            Text("当前 OpenCode 版本暂不支持 Go 额度接口")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        } else if model.limitsStatus != "signed_out" {
+            Text(model.error ?? "暂未获取到 OpenCode 额度，请稍后刷新")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        } else {
+            HStack(spacing: 8) {
+                Text("未登录 OpenCode Go / Console")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 4)
+                Button("登录") { TerminalCommand.run(loginCommand) }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .medium))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(Color.primary.opacity(0.10)))
+                    .foregroundStyle(.primary)
+                    .help("在终端中执行 opencode auth login")
+            }
+        }
+    }
+
+    /// The CLI to sign in with, honouring the configured path.
+    private var loginCommand: String {
+        let configured = store.opencodeCLIPath
+        let binary = configured.isEmpty ? "opencode" : TerminalCommand.quote(configured)
+        return "\(binary) auth login; echo '登录完成，可关闭此窗口'"
+    }
+
+    private func statsView(_ stats: OpenCodeModel.Stats, model: OpenCodeModel) -> some View {
+        HStack(alignment: .bottom, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("近 \(model.days ?? 7) 日 \(stats.totalText) tokens")
+                    .font(.system(size: 11.5, weight: .medium))
+                Text(statsSubtitle(stats))
+                    .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+            }
+            Spacer(minLength: 6)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("近 7 日活跃")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+                ActivitySparkline(activity: stats.activity)
+            }
+        }
+    }
+
+    private func statsSubtitle(_ stats: OpenCodeModel.Stats) -> String {
+        var parts: [String] = []
+        if let cost = stats.cost {
+            parts.append(dollars(cost))
+        }
+        parts.append("\(stats.sessions) 会话")
+        parts.append("\(stats.activeDays) 天活跃")
+        parts.append("连续 \(stats.streak) 天")
+        return parts.joined(separator: " · ")
+    }
+
+    private func budgetFraction(_ budget: OpenCodeModel.Budget, display: String?) -> Double {
+        budget.limit > 0 ? max(0, min(1, (display == "remaining" ? budget.remaining : budget.spent) / budget.limit)) : 0
+    }
+}
+
+struct ActivitySparkline: View {
+    let activity: [OpenCodeModel.Activity]
+    @StateObject private var animator = ChartAnimator()
+
+    var body: some View {
+        let peak = max(activity.map(\.steps).max() ?? 0, 1)
+        HStack(alignment: .bottom, spacing: 2.5) {
+            ForEach(Array(activity.enumerated()), id: \.element.id) { index, day in
+                let ratio = CGFloat(day.steps) / CGFloat(peak)
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(LinearGradient(
+                        colors: [Color.primary.opacity(day.date == activity.last?.date ? 0.72 : 0.45),
+                                 Color.primary.opacity(0.16)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    ))
+                    .frame(width: 6, height: animator.shown ? max(2, ratio * 20) : 1)
+                    .animation(.interpolatingSpring(stiffness: 240, damping: 14)
+                        .delay(Double(index) * 0.03),
+                        value: animator.shown)
+                    .accessibilityLabel("\(day.date)：\(day.steps) steps")
+            }
+        }
+        .frame(height: 20, alignment: .bottom)
+        .onAppear {
+            animator.shown = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                animator.shown = true
+            }
+        }
+    }
+}
+
+func dollars(_ value: Double) -> String {
+    String(format: "$%.2f", value)
 }
 
 // MARK: - Glass bar
@@ -915,6 +1282,41 @@ struct VisualEffectView: NSViewRepresentable {
 
 @MainActor
 enum Preview {
+    static let sampleOpenCode = OpenCodeModel(
+        available: true,
+        reason: nil,
+        days: 7,
+        display: "remaining",
+        workspace: "Team",
+        usageUrl: nil,
+        goMeters: [
+            .init(key: "rolling", label: "滚动额度", used: 42, remaining: 58, amount: 58,
+                  limited: false, resetsAt: nil, resetText: "3小时12分后重置", resetClock: nil),
+            .init(key: "weekly", label: "每周额度", used: 20, remaining: 80, amount: 80,
+                  limited: false, resetsAt: nil, resetText: nil, resetClock: nil),
+            .init(key: "monthly", label: "每月额度", used: 8, remaining: 92, amount: 92,
+                  limited: false, resetsAt: nil, resetText: nil, resetClock: nil),
+        ],
+        budgets: [],
+        stats: .init(
+            tokens: .init(input: 1_500_000, output: 250_000, reasoning: 0,
+                          cacheRead: 100_000, cacheWrite: 0),
+            total: 1_850_000, totalText: "1.9M", inputText: "1.5M", outputText: "250k",
+            cost: 12.34, sessions: 12, activeDays: 5, streak: 3,
+            activity: [
+                .init(date: "10-19", steps: 12, level: 1),
+                .init(date: "10-20", steps: 48, level: 4),
+                .init(date: "10-21", steps: 20, level: 2),
+                .init(date: "10-22", steps: 36, level: 3),
+                .init(date: "10-23", steps: 8, level: 1),
+                .init(date: "10-24", steps: 4, level: 0),
+                .init(date: "10-25", steps: 16, level: 1),
+            ]
+        ),
+        updated: Date().timeIntervalSince1970,
+        error: nil
+    )
+
     static func captureWhenReady(store: UsageStore, attempts: Int) {
         guard attempts > 0 else { return }
         if store.model == nil {
@@ -964,6 +1366,7 @@ enum Preview {
     }
 
     static func capture(store: UsageStore) {
+        store.opencode = sampleOpenCode
         let hosting = NSHostingView(rootView: PopoverView(store: store, openID: UUID(), animateBar: false))
         hosting.frame = NSRect(x: 0, y: 0, width: 330, height: 540)
         let window = NSWindow(contentRect: hosting.frame,
