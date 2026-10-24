@@ -582,10 +582,30 @@ struct PopoverView: View {
                             .foregroundStyle(.orange)
                         }
                         if let error = model.error ?? store.message {
-                            Text(error)
-                                .font(.system(size: 10.5))
-                                .foregroundStyle(.orange)
-                                .fixedSize(horizontal: false, vertical: true)
+                            if error.contains("登录状态") {
+                                HStack(spacing: 8) {
+                                    Text(error)
+                                        .font(.system(size: 10.5))
+                                        .foregroundStyle(.orange)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                    Spacer(minLength: 4)
+                                    Button("登录") {
+                                        TerminalCommand.run("codex login; echo '登录完成，可关闭此窗口'")
+                                    }
+                                    .buttonStyle(.plain)
+                                    .font(.system(size: 10.5, weight: .medium))
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 2)
+                                    .background(Capsule().fill(Color.primary.opacity(0.10)))
+                                    .foregroundStyle(.primary)
+                                    .help("在终端中执行 codex login")
+                                }
+                            } else {
+                                Text(error)
+                                    .font(.system(size: 10.5))
+                                    .foregroundStyle(.orange)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
                         }
                     }
                     hairline

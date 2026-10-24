@@ -59,7 +59,7 @@ cd codex-usage-bar
 
 **首次运行会连什么**
 
-- **Codex**：自动连接。它复用已安装 Codex CLI 的登录状态，直接读取订阅额度；未登录时回退到本机日志。只有 API Key 的登录方式不适用于订阅额度查询。
+- **Codex**：自动连接。它复用已安装 Codex CLI 的登录状态，直接读取订阅额度；未登录时回退到本机日志，并在卡片上给出“登录”按钮（点击会在终端执行 `codex login`）。只有 API Key 的登录方式不适用于订阅额度查询。
 - **OpenCode**：自动连接本地服务（首次会由 `opencode stats` 拉起 OpenCode 后台服务），读取本机统计。Go / Console 额度需要一次交互式登录，卡片上的“登录”按钮会打开终端执行 `opencode auth login`。
 - 安装脚本本身不联网、不登录、不上传任何数据。
 
