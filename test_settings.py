@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 import settings
-from codex_usage import render
+from codex_usage import ui_model
 
 
 class SettingsTests(unittest.TestCase):
@@ -15,57 +15,18 @@ class SettingsTests(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 settings.validate(raw)
 
-    def test_interval_migration_and_persistence(self):
-        with tempfile.TemporaryDirectory() as root:
-            folder = Path(root)
-            config, plugins, template = folder / 'settings.json', folder / 'plugins', folder / 'template'
-            template.write_text('#!/bin/bash\nexec python3 "$HOME/Library/Application Support/CodexUsage/codex_usage.py"\n')
-            settings.apply({}, config, plugins, template)
-            unrelated = plugins / 'other.5m.sh'
-            unrelated.write_text('unrelated')
-            settings.apply({'refresh_minutes': 1, 'display': 'used'}, config, plugins, template)
-            self.assertFalse((plugins / 'codex-usage.5m.sh').exists())
-            self.assertEqual((plugins / 'codex-usage.1m.sh').read_text(), template.read_text())
-            self.assertTrue((plugins / 'codex-usage.1m.sh').stat().st_mode & 0o111)
-            self.assertEqual(settings.read(config)['refresh_minutes'], 1)
-            self.assertEqual(settings.read(config)['display'], 'used')
-            self.assertEqual(unrelated.read_text(), 'unrelated')
-            collision = plugins / 'codex-usage.2m.sh'
-            collision.write_text('another plugin')
-            with self.assertRaises(ValueError):
-                settings.apply({'refresh_minutes': 2}, config, plugins, template)
-            self.assertEqual(settings.read(config)['refresh_minutes'], 1)
-            self.assertEqual(collision.read_text(), 'another plugin')
-
-    def test_failed_wrapper_write_restores_config(self):
-        with tempfile.TemporaryDirectory() as root:
-            folder = Path(root)
-            config, plugins, template = folder / 'settings.json', folder / 'plugins', folder / 'template'
-            template.write_text('CodexUsage/codex_usage.py')
-            settings.apply({}, config, plugins, template)
-            original = settings.atomic_write
-            def fail_wrapper(path, *args):
-                if path.parent == plugins:
-                    raise OSError('test: read-only plugin directory')
-                original(path, *args)
-            with patch.object(settings, 'atomic_write', side_effect=fail_wrapper), self.assertRaises(OSError):
-                settings.apply({'refresh_minutes': 1}, config, plugins, template)
-            self.assertEqual(settings.read(config)['refresh_minutes'], 5)
-            self.assertTrue((plugins / 'codex-usage.5m.sh').exists())
-
     def test_display_options_and_settings_action(self):
         data = {'refreshed_at': 1000, 'latest': {'timestamp': 999, 'limits': {
             'primary': {'used_percent': 20, 'resets_at': 9999},
             'secondary': {'used_percent': 70, 'resets_at': 9999}}},
             'today': {'total_tokens': 123}, 'skipped_files': 0}
-        output = render(data, {'window': 'secondary', 'display': 'used',
-                              'show_tokens': False, 'show_countdown': False, 'refresh_minutes': 2})
-        self.assertIn('Codex 周用 70%', output.splitlines()[0])
-        self.assertNotIn('今日 tokens', output)
-        self.assertNotIn('倒计时', output)
-        self.assertIn('param1=settings', output)
-        self.assertIn('每 2 分钟扫描本机日志', output)
-        self.assertIn('Codex 5h余 80%', render(data).splitlines()[0])
+        model = ui_model(data, {'window': 'secondary', 'display': 'used',
+                                'show_tokens': False, 'show_countdown': False, 'refresh_minutes': 2})
+        self.assertEqual(model['title'], 'Codex 周用 70%')
+        self.assertIsNone(model['tokens'])
+        self.assertNotIn('倒计时', ' '.join(model['details']))
+        self.assertIn('每 2 分钟扫描本机日志', model['details'])
+        self.assertEqual(ui_model(data)['title'], 'Codex 5h余 80%')
 
     def test_corrupt_settings_fallback(self):
         with tempfile.TemporaryDirectory() as root:
@@ -90,21 +51,32 @@ class SettingsTests(unittest.TestCase):
             'secondary': {'window_minutes': 10080, 'used_percent': 95, 'resets_at': 9999}}},
             'today': {'total_tokens': 0}, 'skipped_files': 0}
         config = {'low_quota_warning': True, 'stale_minutes': 30}
-        output = render(data, config)
-        self.assertIn('⚠ 5 小时、每周剩余额度 ≤ 20%', output)
-        self.assertNotIn('⏱', output)
-        self.assertNotIn('⚠', render(data, {'low_quota_warning': False}))
+        model = ui_model(data, config)
+        self.assertEqual(model['low_quota'], ['5 小时', '每周'])
+        self.assertFalse(model['stale'])
+        self.assertEqual(ui_model(data, {'low_quota_warning': False})['low_quota'], [])
         config['stale_minutes'] = 15
-        output = render(data, config)
-        self.assertNotIn('⚠', output)
-        self.assertIn('⏱', output)
-        self.assertIn('额度记录：', output)
-        self.assertIn('本机扫描：', output)
+        model = ui_model(data, config)
+        self.assertEqual(model['low_quota'], [])
+        self.assertTrue(model['stale'])
+        self.assertIn('⏱', model['title'])
+        self.assertIn('额度来源：', ' '.join(model['details']))
+        self.assertTrue(model['updated'])
         data['latest']['timestamp'] = 1999
         data['latest']['limits']['secondary']['resets_at'] = 1998
         config['low_quota_threshold'] = 10
-        self.assertNotIn('⚠', render(data, config))
+        self.assertEqual(ui_model(data, config)['low_quota'], [])
 
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ProviderSettingsTests(unittest.TestCase):
+    def test_provider_cards_can_be_hidden(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = Path(root) / 'settings.json'
+            settings.save({'show_codex': False, 'show_opencode': True}, config)
+            saved = settings.read(config)
+            self.assertFalse(saved['show_codex'])
+            self.assertTrue(saved['show_opencode'])

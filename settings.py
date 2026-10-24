@@ -1,8 +1,6 @@
-"""Validated settings shared by the native window and the SwiftBar plugin."""
+"""Validated settings shared by the native menu bar app and the settings window."""
 import json
 import os
-import re
-import subprocess
 import tempfile
 from pathlib import Path
 
@@ -11,7 +9,8 @@ CONFIG = SUPPORT / 'settings.json'
 DEFAULTS = dict(refresh_minutes=5, window='primary', display='remaining',
                 show_tokens=True, show_countdown=True, label_size=7,
                 value_size=12, weight='regular', width=30, value_offset=0,
-                stale_minutes=15, low_quota_warning=False, low_quota_threshold=20)
+                stale_minutes=15, low_quota_warning=False, low_quota_threshold=20,
+                show_codex=True, show_opencode=True)
 INTERVALS = (1, 2, 5, 10, 15, 30)
 
 
@@ -27,7 +26,7 @@ def validate(raw):
                              stale_minutes=(15, 30, 60, 120), low_quota_threshold=(10, 20, 30)).items():
         if result[key] not in choices or isinstance(result[key], bool):
             raise ValueError(f'无效设置：{key}')
-    for key in ('show_tokens', 'show_countdown', 'low_quota_warning'):
+    for key in ('show_tokens', 'show_countdown', 'low_quota_warning', 'show_codex', 'show_opencode'):
         if not isinstance(result[key], bool):
             raise ValueError(f'无效设置：{key}')
     for key in ('refresh_minutes', 'stale_minutes', 'low_quota_threshold'):
@@ -47,13 +46,6 @@ def read(path=CONFIG):
         return dict(DEFAULTS)
 
 
-def plugin_directory():
-    result = subprocess.run(['/usr/bin/defaults', 'read', 'com.ameba.SwiftBar', 'PluginDirectory'],
-                            capture_output=True, text=True, timeout=5)
-    value = result.stdout.strip()
-    return Path(value).expanduser() if result.returncode == 0 and value else Path.home() / 'Library/Application Support/SwiftBar/Plugins'
-
-
 def atomic_write(path, content, mode=0o600):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix='.codex-usage-', dir=str(path.parent))
@@ -67,32 +59,8 @@ def atomic_write(path, content, mode=0o600):
             os.unlink(name)
 
 
-def apply(raw, config=CONFIG, plugins=None, template=None):
-    settings = validate(raw)
-    plugins = plugin_directory() if plugins is None else plugins
-    template = SUPPORT / 'codex-usage.5m.sh' if template is None else template
-    source = template.read_text()
-    target = plugins / f"codex-usage.{settings['refresh_minutes']}m.sh"
-    # Refuse to replace another plugin with a coinciding name.
-    owned = []
-    for path in plugins.glob('codex-usage.*m.sh'):
-        if re.fullmatch(r'codex-usage\.\d+m\.sh', path.name):
-            if 'CodexUsage/codex_usage.py' not in path.read_text():
-                if path == target:
-                    raise ValueError('插件文件名已被其他脚本占用')
-            else:
-                owned.append(path)
-    previous = config.read_text() if config.exists() else None
-    atomic_write(config, json.dumps(settings, ensure_ascii=False, indent=2) + '\n')
-    try:
-        atomic_write(target, source, 0o755)
-    except OSError:
-        if previous is not None:
-            atomic_write(config, previous)
-        else:
-            config.unlink(missing_ok=True)
-        raise
-    for path in owned:
-        if path != target:
-            path.unlink()  # Only this application's obsolete interval wrapper.
-    return settings
+def save(raw, config=CONFIG):
+    """Persist settings for the native menu bar app."""
+    values = validate(raw)
+    atomic_write(config, json.dumps(values, ensure_ascii=False, indent=2) + '\n')
+    return values

@@ -15,6 +15,8 @@ struct Preferences: Codable, Equatable {
     var stale_minutes = 15
     var low_quota_warning = false
     var low_quota_threshold = 20
+    var show_codex = true
+    var show_opencode = true
 }
 
 @MainActor final class SettingsStore: ObservableObject {
@@ -71,9 +73,13 @@ struct Preferences: Codable, Equatable {
     }
 
     func refresh() {
-        let opened = NSWorkspace.shared.open(URL(string: "swiftbar://refreshallplugins")!)
-        failed = !opened
-        message = opened ? "已请求查询最新额度；查询结果将在菜单中更新" : "无法打开 SwiftBar，请确认已安装并运行"
+        notifyMenuBar()
+        message = "已请求查询最新额度；查询结果将在菜单中更新"
+    }
+
+    private func notifyMenuBar() {
+        DistributedNotificationCenter.default().post(name: Notification.Name("local.codexusage.settingsChanged"),
+                                                     object: nil)
     }
 
     func save() {
@@ -88,7 +94,7 @@ struct Preferences: Codable, Equatable {
                     let process = Process()
                     let input = Pipe(), output = Pipe(), errors = Pipe()
                     process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-                    process.arguments = [script, "--apply-settings"]
+                    process.arguments = [script, "--save-settings"]
                     process.standardInput = input
                     process.standardOutput = output
                     process.standardError = errors
@@ -98,7 +104,7 @@ struct Preferences: Codable, Equatable {
                     process.waitUntilExit()
                     if process.terminationStatus != 0 {
                         let detail = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                        return "保存失败，请检查插件目录是否可写。\n" + String(detail.suffix(240))
+                        return "保存失败，请检查设置目录是否可写。\n" + String(detail.suffix(240))
                     }
                     return nil
                 } catch { return "保存失败：\(error.localizedDescription)" }
@@ -109,6 +115,7 @@ struct Preferences: Codable, Equatable {
                 failed = true
             } else {
                 saved = proposed
+                notifyMenuBar()
                 message = "已应用 · 每 \(proposed.refresh_minutes) 分钟刷新"
             }
         }
@@ -134,14 +141,15 @@ struct SettingsView: View {
                 .padding(14)
                 .background(Color.black, in: RoundedRectangle(cornerRadius: 12))
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("Codex 用量设置").font(.title2.weight(.semibold))
-                    Text("预览为示例数据，保存后应用到菜单栏").font(.caption).foregroundStyle(.secondary)
+                    Text("用量设置").font(.title2.weight(.semibold))
+                    Text("Codex 与 OpenCode 的菜单栏配置").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
             }.padding(24)
 
             TabView {
-                generalSettings.tabItem { Label("常用", systemImage: "slider.horizontal.3") }
+                codexSettings.tabItem { Label("Codex", systemImage: "terminal") }
+                generalSettings.tabItem { Label("通用", systemImage: "slider.horizontal.3") }
                 appearanceSettings.tabItem { Label("外观", systemImage: "textformat.size") }
             }
             .padding(.horizontal, 16)
@@ -164,58 +172,88 @@ struct SettingsView: View {
         .onChange(of: store.draft) { _ in store.message = ""; store.failed = false }
     }
 
+    private var codexVisible: Binding<Bool> {
+        Binding(
+            get: { store.draft.show_codex },
+            set: { value in
+                store.draft.show_codex = value
+                if !value && !store.draft.show_opencode { store.draft.show_opencode = true }
+            }
+        )
+    }
+
+    private var openCodeVisible: Binding<Bool> {
+        Binding(
+            get: { store.draft.show_opencode },
+            set: { value in
+                store.draft.show_opencode = value
+                if !value && !store.draft.show_codex { store.draft.show_codex = true }
+            }
+        )
+    }
+
+    private var codexSettings: some View {
+        Form {
+            Section {
+                Toggle("显示 Codex 卡片", isOn: codexVisible)
+                Text("菜单栏和弹层顶部的 Codex 卡片；至少保留一张卡片。")
+                    .font(.caption).foregroundStyle(.secondary)
+            } header: { Text("Codex 卡片") }
+            Section {
+                Picker("菜单栏主数字", selection: Binding(
+                    get: { store.draft.window },
+                    set: { selected in
+                        if store.canSelect(selected) { store.draft.window = selected }
+                    }
+                )) {
+                    Text(store.canSelect("primary") ? "5 小时额度" : "5 小时额度（暂无数据）")
+                        .tag("primary").disabled(!store.canSelect("primary"))
+                    Text(store.canSelect("secondary") ? "每周" : "每周（暂无数据）")
+                        .tag("secondary").disabled(!store.canSelect("secondary"))
+                }
+                Text(store.availabilityKnown && store.availableWindows.isEmpty
+                     ? "当前查询与本机记录均未提供可用额度，暂不能选择。"
+                     : "下拉菜单始终同时显示 5 小时和每周额度；暂无数据的选项不可选择。")
+                    .font(.caption).foregroundStyle(.secondary)
+                Picker("数字含义", selection: $store.draft.display) {
+                    Text("剩余百分比").tag("remaining")
+                    Text("已用百分比").tag("used")
+                }
+                Toggle("显示今日 tokens", isOn: $store.draft.show_tokens)
+                Toggle("显示重置倒计时", isOn: $store.draft.show_countdown)
+            } header: { Text("用量显示") }
+            Section {
+                Toggle("菜单内低额度提示", isOn: $store.draft.low_quota_warning)
+                if store.draft.low_quota_warning {
+                    Picker("剩余不超过", selection: $store.draft.low_quota_threshold) {
+                        ForEach([10, 20, 30], id: \.self) { value in Text("\(value)%").tag(value) }
+                    }
+                }
+                Picker("额度记录过时提醒", selection: $store.draft.stale_minutes) {
+                    ForEach([15, 30, 60, 120], id: \.self) { minute in Text("超过 \(minute) 分钟").tag(minute) }
+                }
+                Text("低额度提示检查两个窗口，仅在数据未过时时显示；过时以额度记录时间计算。")
+                    .font(.caption).foregroundStyle(.secondary)
+            } header: { Text("提醒") }
+        }.formStyle(.grouped)
+    }
+
     private var generalSettings: some View {
         Form {
-                Section {
-                    Picker("刷新间隔", selection: $store.draft.refresh_minutes) {
-                        ForEach([1, 2, 5, 10, 15, 30], id: \.self) { minute in
-                            Text("每 \(minute) 分钟" + (minute == 5 ? "（默认）" : "")).tag(minute)
-                        }
+            Section {
+                Picker("刷新间隔", selection: $store.draft.refresh_minutes) {
+                    ForEach([1, 2, 5, 10, 15, 30], id: \.self) { minute in
+                        Text("每 \(minute) 分钟" + (minute == 5 ? "（默认）" : "")).tag(minute)
                     }
-                    Text("主动查询账户额度；查询失败时回退到本机日志并标注。今日 tokens 为本机估算。")
-                        .font(.caption).foregroundStyle(.secondary)
-                    HStack {
-                        Button("立即查询额度") { store.refresh() }
-                        Spacer()
-                        Link("打开官方用量页面", destination: URL(string: "https://chatgpt.com/codex/settings/usage")!)
-                    }
-                } header: { Text("刷新") }
-                Section {
-                    Picker("菜单栏主数字", selection: Binding(
-                        get: { store.draft.window },
-                        set: { selected in
-                            if store.canSelect(selected) { store.draft.window = selected }
-                        }
-                    )) {
-                        Text(store.canSelect("primary") ? "5 小时额度" : "5 小时额度（暂无数据）")
-                            .tag("primary").disabled(!store.canSelect("primary"))
-                        Text(store.canSelect("secondary") ? "每周" : "每周（暂无数据）")
-                            .tag("secondary").disabled(!store.canSelect("secondary"))
-                    }
-                    Text(store.availabilityKnown && store.availableWindows.isEmpty
-                         ? "当前查询与本机记录均未提供可用额度，暂不能选择。"
-                         : "下拉菜单始终同时显示 5 小时和每周额度；暂无数据的选项不可选择。")
-                        .font(.caption).foregroundStyle(.secondary)
-                    Picker("数字含义", selection: $store.draft.display) {
-                        Text("剩余百分比").tag("remaining")
-                        Text("已用百分比").tag("used")
-                    }
-                    Toggle("显示今日 tokens", isOn: $store.draft.show_tokens)
-                    Toggle("显示重置倒计时", isOn: $store.draft.show_countdown)
-                } header: { Text("用量显示") }
-                Section {
-                    Toggle("菜单内低额度提示", isOn: $store.draft.low_quota_warning)
-                    if store.draft.low_quota_warning {
-                        Picker("剩余不超过", selection: $store.draft.low_quota_threshold) {
-                            ForEach([10, 20, 30], id: \.self) { value in Text("\(value)%").tag(value) }
-                        }
-                    }
-                    Picker("额度记录过时提醒", selection: $store.draft.stale_minutes) {
-                        ForEach([15, 30, 60, 120], id: \.self) { minute in Text("超过 \(minute) 分钟").tag(minute) }
-                    }
-                    Text("低额度提示检查两个窗口，仅在数据未过时时显示；过时以额度记录时间计算。")
-                        .font(.caption).foregroundStyle(.secondary)
-                } header: { Text("提醒") }
+                }
+                Text("同时刷新 Codex 与 OpenCode；查询失败时只影响对应卡片。")
+                    .font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Button("立即查询额度") { store.refresh() }
+                    Spacer()
+                    Link("打开 Codex 官方用量页面", destination: URL(string: "https://chatgpt.com/codex/settings/usage")!)
+                }
+            } header: { Text("刷新") }
         }.formStyle(.grouped)
     }
 

@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from codex_usage import collect, render, window_text, countdown, quota_windows, available_windows
+from codex_usage import collect, summary, window_text, countdown, quota_windows, available_windows, ui_model
 
 
 class UsageTests(unittest.TestCase):
@@ -26,18 +26,35 @@ class UsageTests(unittest.TestCase):
             data = collect(home, now.timestamp())
             self.assertEqual(data['today']['total_tokens'], 75)
             self.assertEqual(data['latest']['limits']['primary']['used_percent'], 82)
+            self.assertEqual(len(data['history']), 7)
+            self.assertEqual(data['history'][-1]['tokens'], 75)
+            self.assertEqual(data['history'][-1]['text'], '75')
+            self.assertIn('input_tokens', data['history'][-1])
+            self.assertIn('output_tokens', data['history'][-1])
 
     def test_expired_window_and_no_data(self):
         self.assertIsNone(window_text({'used_percent': 90, 'resets_at': 10}, 20)[1])
         with tempfile.TemporaryDirectory() as root:
-            self.assertIn('暂无额度数据', render(collect(Path(root), 20)))
+            model = ui_model(collect(Path(root), 20))
+        self.assertIsNone(model['headline'])
+        self.assertIn('尚未找到额度记录', model['details'])
 
-    def test_colors_and_staleness(self):
+    def test_staleness_marks_the_snapshot(self):
         data = {'refreshed_at': 1000, 'latest': {'timestamp': 999, 'limits': {'primary': {'used_percent': 96, 'resets_at': 9999}}}, 'today': dict.fromkeys(['total_tokens', 'input_tokens', 'cached_input_tokens', 'output_tokens'], 0), 'skipped_files': 0}
-        self.assertIn('#E5484D', render(data).splitlines()[0])
+        self.assertFalse(ui_model(data)['stale'])
         data['latest']['timestamp'] = 1
-        self.assertIn('⏱', render(data).splitlines()[0])
-        self.assertIn('#888888', render(data).splitlines()[0])
+        self.assertTrue(ui_model(data)['stale'])
+        self.assertIn('⏱', ui_model(data)['title'])
+
+    def test_terminal_summary_reports_windows(self):
+        data = {'refreshed_at': 1000, 'latest': {'timestamp': 999, 'limits': {
+            'primary': {'window_minutes': 10080, 'used_percent': 19, 'resets_at': 9999}}},
+            'today': {'total_tokens': 1234}, 'skipped_files': 0, 'quota_source': 'api'}
+        text = summary(data)
+        self.assertIn('Codex 周余 81%', text)
+        self.assertIn('本周额度', text)
+        self.assertIn('5小时额度', text)
+        self.assertIn('Codex 查询接口', text)
 
     def test_reset_countdown(self):
         self.assertEqual(countdown(90061, 0), '1天1小时')
@@ -51,11 +68,13 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(quota_windows(limits), {'primary': five_hour, 'secondary': weekly})
         data = {'refreshed_at': 1000, 'latest': {'timestamp': 999, 'limits': limits},
                 'today': {'total_tokens': 0}, 'skipped_files': 0}
-        output = render(data)
-        self.assertIn('Codex 5h余 80%', output.splitlines()[0])
-        self.assertIn('5小时额度  剩余 80%', output)
-        self.assertIn('本周额度  剩余 51%', output)
-        self.assertIn('Codex 周余 51%', render(data, {'window': 'secondary'}).splitlines()[0])
+        model = ui_model(data)
+        self.assertEqual(model['title'], 'Codex 5h余 80%')
+        self.assertEqual(model['headline']['label'], '5小时额度')
+        self.assertEqual(model['headline']['amount'], 80)
+        self.assertEqual(model['windows'][1]['label'], '本周额度')
+        self.assertEqual(model['windows'][1]['amount'], 51)
+        self.assertEqual(ui_model(data, {'window': 'secondary'})['title'], 'Codex 周余 51%')
 
     def test_weekly_only_snapshot_does_not_reuse_older_five_hour_quota(self):
         def event(when, limits):
@@ -67,11 +86,12 @@ class UsageTests(unittest.TestCase):
             (home / 'sessions/a.jsonl').write_text('\n'.join([
                 event(998, {'primary': {'window_minutes': 300, 'used_percent': 20, 'resets_at': 9999}}),
                 event(999, {'primary': {'window_minutes': 10080, 'used_percent': 49, 'resets_at': 9999}, 'secondary': None})]))
-            output = render(collect(home, 1000))
-            self.assertIn('5小时额度：未提供', output)
-            self.assertIn('本周额度  剩余 51%', output)
-            self.assertNotIn('20%', output)
-            self.assertIn('Codex 周余 51%', output.splitlines()[0])
+            model = ui_model(collect(home, 1000))
+            windows = {w['label']: w for w in model['windows']}
+            self.assertEqual(windows['5小时额度']['status'], '未提供')
+            self.assertEqual(windows['本周额度']['amount'], 51)
+            self.assertNotIn('20%', json.dumps(model, ensure_ascii=False))
+            self.assertEqual(model['title'], 'Codex 周余 51%')
 
     def test_unknown_duration_is_not_mislabelled(self):
         self.assertEqual(quota_windows({'primary': {'window_minutes': 1440, 'used_percent': 10}}),
@@ -82,18 +102,20 @@ class UsageTests(unittest.TestCase):
 
     def test_both_sections_visible_without_data(self):
         with tempfile.TemporaryDirectory() as root:
-            output = render(collect(Path(root), 1000))
-        self.assertIn('5小时额度：未提供', output)
-        self.assertIn('本周额度：未提供', output)
+            model = ui_model(collect(Path(root), 1000))
+        self.assertEqual(model['windows'], [])
+        self.assertIsNone(model['headline'])
+        self.assertIn('尚未找到额度记录', model['details'])
 
     def test_available_windows_and_menu_fallback(self):
         data = {'refreshed_at': 1000, 'latest': {'timestamp': 999, 'limits': {
             'primary': {'window_minutes': 10080, 'used_percent': 48, 'resets_at': 9999}}},
             'today': {'total_tokens': 0}, 'skipped_files': 0}
         self.assertEqual(available_windows(data), {'primary': False, 'secondary': True})
-        output = render(data, {'window': 'primary'})
-        self.assertIn('Codex 周余 52%', output.splitlines()[0])
-        self.assertNotIn('Codex 待更新', output.splitlines()[0])
+        model = ui_model(data, {'window': 'primary'})
+        self.assertEqual(model['title'], 'Codex 周余 52%')
+        self.assertEqual(model['displayed_key'], 'secondary')
+        self.assertNotIn('Codex 待更新', model['title'])
         self.assertEqual(available_windows({'refreshed_at': 1, 'latest': None}),
                          {'primary': False, 'secondary': False})
 

@@ -32,15 +32,13 @@
 | 没有 5 小时窗口？ | 显示“未提供”，不补造数据、不拼接旧快照。 |
 | 想调得顺手？ | 原生 SwiftUI 设置，调整刷新周期、显示窗口、字号和提醒。 |
 
-菜单栏采用两行紧凑图形：上方 `Codex`，下方为当前窗口的百分比；悬停可查看窗口说明。窗口不可用时自动切换到另一个有数据的窗口。图形渲染器不可用时回退为文字标题。
+菜单栏采用两行紧凑图形：上方 `Codex`，下方为当前窗口的百分比；悬停可查看窗口说明。窗口不可用时自动切换到另一个有数据的窗口。点开后是原生毛玻璃弹层，进度条以灰色渐变呈现，并在打开时播放增长动画。
 
 ## 快速开始
 
-需要 **macOS 13+**、已登录 ChatGPT 账号的 [Codex CLI](https://learn.chatgpt.com/docs/cli)、[SwiftBar](https://github.com/swiftbar/SwiftBar)，以及 Xcode Command Line Tools 提供的 `swiftc` 和 `/usr/bin/python3`。
+需要 **macOS 13+**、已登录 ChatGPT 账号的 [Codex CLI](https://learn.chatgpt.com/docs/cli)，以及 Xcode Command Line Tools 提供的 `swiftc` 和 `/usr/bin/python3`。不再依赖 SwiftBar。
 
 ```bash
-# 已安装 SwiftBar 和 Command Line Tools 时可跳过前两行
-brew install --cask swiftbar
 xcode-select --install
 
 git clone https://github.com/ZhengYitong2333/codex-usage-bar.git
@@ -48,7 +46,7 @@ cd codex-usage-bar
 ./install.sh
 ```
 
-安装脚本会在本机编译设置程序和菜单栏图形渲染器，沿用已有的 SwiftBar 插件目录与个人设置，并配置登录时启动 SwiftBar。默认刷新周期为 **5 分钟**，在“设置…”中可改为 **1 / 2 / 5 / 10 / 15 / 30 分钟**。
+安装脚本会在本机编译原生菜单栏应用和设置程序，配置登录时启动，并清理旧版本写入的 SwiftBar 插件。默认刷新周期为 **5 分钟**，在“设置…”中可改为 **1 / 2 / 5 / 10 / 15 / 30 分钟**。点开菜单栏图标会显示毛玻璃弹层，额度进度条会从 0 增长到当前值。
 
 如不需要配置登录启动：
 
@@ -56,7 +54,12 @@ cd codex-usage-bar
 ./install.sh --no-login-item
 ```
 
-点开菜单栏图标后，可以选择“立即查询额度”“打开用量页面”或“设置…”。首次使用前，请确认 `codex login` 已完成 ChatGPT 登录；只有 API Key 的登录方式不适用于此订阅额度查询。
+点开菜单栏图标后，可以选择“立即查询额度”“打开用量页面”或“设置…”。
+
+**首次运行会连什么**
+
+- **Codex**：自动连接。它复用已安装 Codex CLI 的登录状态，直接读取订阅额度；未登录时回退到本机日志。只有 API Key 的登录方式不适用于订阅额度查询。
+- 安装脚本本身不联网、不登录、不上传任何数据。
 
 ## 数据从哪里来
 
@@ -67,7 +70,7 @@ Codex 已有登录
 codex app-server · stdio
       │ account/rateLimits/read
       ▼
-当前额度快照 ─────────────► SwiftBar 菜单
+当前额度快照 ─────────────► 原生菜单栏弹层
       ▲                       ▲
       │ 接口失败时回退          │ 今日 tokens：本机估算
       └────── 本机会话日志 ─────┘
@@ -86,7 +89,7 @@ codex app-server · stdio
 - **常用**：刷新周期、主显示窗口、已用/剩余、今日 tokens、重置倒计时。
 - **外观**：标签字号、数字字号、字重、组件宽度及数字垂直位置，带示例预览。
 - **提醒**：可选低额度提示与记录过时阈值；提示显示在菜单内。
-- **保存**：只修改本机设置；更改刷新周期会迁移本工具的插件文件，保留其他插件。
+- **保存**：只修改本机设置，并立即通知菜单栏应用重新查询。
 
 设置保存在 `~/Library/Application Support/CodexUsage/settings.json`，不随仓库分发。
 
@@ -115,19 +118,21 @@ python3 script/check_privacy.py
 诊断命令在本机输出额度及估算统计，**分享输出前请自行去除个人用量**：
 
 ```bash
-python3 codex_usage.py --json
-python3 codex_usage.py --local-only --json
+python3 codex_usage.py                     # 终端可读摘要
+python3 codex_usage.py --json              # 原始统计
+python3 codex_usage.py --ui-json           # 菜单栏应用使用的视图模型
+python3 codex_usage.py --local-only --json # 只读本机日志
 ```
 
 ```text
-codex_usage.py         日志统计、接口与菜单的整合
+codex_usage.py         日志统计、接口与视图模型的整合
 quota_api.py           App Server 初始化、额度读取与归一化
-settings.py           设置校验、持久化、插件周期迁移
+settings.py           设置校验与持久化
+CodexUsageApp.swift    原生菜单栏应用（毛玻璃弹层、动画进度条）
 SettingsApp.swift     原生设置窗口
-menu_icon.swift       适配深浅色的菜单栏图形
 install.sh            独立安装入口
 script/               构建与隐私检查
-test_*.py             统计、设置、接口和故障回退测试
+test_*.py             统计、设置、接口、OpenCode 和故障回退测试
 docs/assets/hero.svg  使用虚构数据的项目展示图
 ```
 
@@ -143,17 +148,17 @@ docs/assets/hero.svg  使用虚构数据的项目展示图
 
 **能只读本机日志吗？**
 
-可以使用 `--local-only` 命令行参数。默认安装的菜单栏插件使用主动查询。
+可以使用 `--local-only` 命令行参数。默认安装的菜单栏应用使用主动查询。
 
 **怎么停用？**
 
-在 SwiftBar 中停用本工具的插件。若需要取消本工具配置的登录启动：
+先退出菜单栏里的本工具，再取消登录启动：
 
 ```bash
-launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/local.codex-usage.swiftbar.plist"
+launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/local.codex-usage.menubar.plist"
 ```
 
-之后可将该 plist 文件移到废纸篓；不要删除其他工具共享的 SwiftBar 安装。
+之后可将该 plist 文件移到废纸篓，并删除 `~/Applications/Codex Usage.app`。
 
 ## License
 

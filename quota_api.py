@@ -86,7 +86,7 @@ def query(home, timeout=12):
             process.stdin.flush()
 
         send({'id': 1, 'method': 'initialize', 'params': {
-            'clientInfo': {'name': 'codex_usage_swiftbar', 'title': 'Codex Usage', 'version': '1.3.0'},
+            'clientInfo': {'name': 'codex_usage_bar', 'title': 'Codex Usage', 'version': '2.0.0'},
         }})
         initialized = False
         while True:

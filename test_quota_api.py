@@ -54,11 +54,12 @@ class QuotaTests(unittest.TestCase):
             result = codex_usage.collect_usage(Path('.'))
         self.assertEqual(result['quota_source'], 'api')
         self.assertIs(result['latest'], live)
-        output = codex_usage.render(result)
-        self.assertIn('立即查询额度 | refresh=true', output)
-        self.assertIn('额度来源：Codex 查询接口', output)
-        self.assertIn('5小时额度：接口未提供', output)
-        self.assertNotIn('77%', output)
+        model = codex_usage.ui_model(result)
+        self.assertEqual(model['source'], 'Codex 查询接口')
+        self.assertEqual(model['query_enabled'], True)
+        windows = {w['label']: w for w in model['windows']}
+        self.assertEqual(windows['5小时额度']['reason'], '接口未提供')
+        self.assertNotIn('77%', json.dumps(model, ensure_ascii=False))
 
     def test_failure_labels_fallback_without_rejuvenating_log(self):
         base = local_data()
@@ -66,16 +67,17 @@ class QuotaTests(unittest.TestCase):
         with patch.object(codex_usage, 'collect', return_value=base), patch.object(quota_api, 'query', side_effect=quota_api.QuotaQueryError('额度查询超时，稍后重试')):
             result = codex_usage.collect_usage(Path('.'))
         self.assertEqual(result['latest']['timestamp'], stamp)
-        output = codex_usage.render(result)
-        self.assertIn('查询失败，显示本机日志记录', output)
-        self.assertIn('额度记录已过时', output)
-        self.assertIn('额度来源：本机日志', output)
+        model = codex_usage.ui_model(result)
+        self.assertEqual(model['source'], '本机日志')
+        self.assertIn('额度查询超时，稍后重试', model['error'])
+        self.assertTrue(model['stale'])
 
     def test_failure_without_log_has_no_fabricated_quota(self):
         with patch.object(codex_usage, 'collect', return_value=local_data(False)), patch.object(quota_api, 'query', side_effect=quota_api.QuotaQueryError('额度接口拒绝访问')):
-            output = codex_usage.render(codex_usage.collect_usage(Path('.')))
-        self.assertIn('额度查询失败，暂无可用记录', output)
-        self.assertNotIn('image=', output)
+            model = codex_usage.ui_model(codex_usage.collect_usage(Path('.')))
+        self.assertIsNone(model['headline'])
+        self.assertIn('额度查询失败，暂无可用记录', ' '.join(model['details']))
+        self.assertEqual(model['error'], '额度接口拒绝访问')
 
     def test_local_only_never_calls_api(self):
         with patch.object(codex_usage, 'collect', return_value=local_data()), patch.object(quota_api, 'query') as query:
