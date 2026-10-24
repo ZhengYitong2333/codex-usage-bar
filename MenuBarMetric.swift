@@ -32,7 +32,7 @@ enum MenuBarMetric: String, Codable, CaseIterable, Identifiable {
         case .codex: return "Codex 当前主额度（自动）"
         case .codexPrimary: return "Codex · 5 小时"
         case .codexSecondary: return "Codex · 每周"
-        case .openCodeRolling: return "OpenCode · 滚动额度"
+        case .openCodeRolling: return "OpenCode · 5 小时额度"
         case .openCodeWeekly: return "OpenCode · 每周"
         case .openCodeMonthly: return "OpenCode · 每月"
         }
@@ -43,9 +43,9 @@ enum MenuBarMetric: String, Codable, CaseIterable, Identifiable {
         case .codex: return "Codex"
         case .codexPrimary: return "Codex 5h"
         case .codexSecondary: return "Codex 周"
-        case .openCodeRolling: return "Go 滚动"
-        case .openCodeWeekly: return "Go 周"
-        case .openCodeMonthly: return "Go 月"
+        case .openCodeRolling: return "Go 5H"
+        case .openCodeWeekly: return "OpenCode"
+        case .openCodeMonthly: return "OpenCode"
         }
     }
 

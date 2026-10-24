@@ -422,18 +422,13 @@ def normalize(stats, limits, days, display, now,
             result['usage_url'] = workspace.get('usageURL') if isinstance(workspace.get('usageURL'), str) else None
         go = limits.get('go')
         if isinstance(go, dict):
-            for key, label in (('rolling', '滚动额度'), ('weekly', '每周额度'), ('monthly', '每月额度')):
-                entry = meter(key, label, go.get(key), now, display)
-                if entry is not None:
-                    result['menu_bar_meters'].append(entry)
+            labels = (('rolling', '5 小时额度'), ('weekly', '每周额度'), ('monthly', '每月额度'))
+            meters = {key: meter(key, label, go.get(key), now, display) for key, label in labels}
+            result['menu_bar_meters'].extend(m for m in meters.values() if m is not None)
             enabled = {'rolling': show_rolling, 'weekly': show_weekly, 'monthly': show_monthly}
             if not show_go:
                 enabled = {key: False for key in enabled}
-            result['go'] = {key: meter(key, label, go.get(key), now, display)
-                            for key, label in (('rolling', '滚动额度'),
-                                               ('weekly', '每周额度'),
-                                               ('monthly', '每月额度'))
-                            if enabled[key]}
+            result['go'] = {key: m for key, m in meters.items() if enabled[key] and m is not None}
             result['go_meters'] = [m for m in result['go'].values() if m]
             result['go'] = result['go'] if result['go_meters'] else None
         budgets = limits.get('budgets') if isinstance(limits.get('budgets'), list) else []

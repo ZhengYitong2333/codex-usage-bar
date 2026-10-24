@@ -284,7 +284,7 @@ struct SettingsView: View {
             } header: { Text("OpenCode 卡片") }
             Section {
                 Toggle("显示 Go 额度", isOn: $store.draft.opencode_show_go)
-                Toggle("滚动额度", isOn: $store.draft.opencode_show_rolling)
+                Toggle("5 小时额度", isOn: $store.draft.opencode_show_rolling)
                     .disabled(!store.draft.opencode_show_go)
                 Toggle("每周额度", isOn: $store.draft.opencode_show_weekly)
                     .disabled(!store.draft.opencode_show_go)

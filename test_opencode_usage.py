@@ -37,7 +37,7 @@ class OpenCodeUsageTests(unittest.TestCase):
         self.assertEqual(model['stats']['input_text'], '1.5M')
         self.assertEqual(model['stats']['cost'], 12.34)
         self.assertEqual([m['label'] for m in model['go_meters']],
-                         ['滚动额度', '每周额度', '每月额度'])
+                         ['5 小时额度', '每周额度', '每月额度'])
         self.assertEqual(model['go_meters'][0]['remaining'], 60)
         self.assertTrue(model['go_meters'][2]['limited'])
         self.assertEqual(model['go_meters'][0]['reset_text'], '1小时0分后重置')
@@ -77,7 +77,7 @@ class ConsoleFallbackTests(unittest.TestCase):
                    'budgets': []}
         model = opencode_usage.normalize({'tokens': {'input': 1}}, payload, 7, 'remaining', now=1_800_000_000)
         self.assertEqual([m['label'] for m in model['go_meters']],
-                         ['滚动额度', '每周额度', '每月额度'])
+                         ['5 小时额度', '每周额度', '每月额度'])
         self.assertTrue(model['go_meters'][1]['limited'])
         self.assertEqual(model['go_meters'][0]['remaining'], 70)
         self.assertEqual(model['workspace'], 'Team')

@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import OSLog
 
 // MARK: - Model returned by codex_usage.py --ui-json
 
@@ -373,9 +374,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var chartPanelState = ChartPanelState()
     private var hideWorkItem: DispatchWorkItem?
     private var panelGeneration = 0
+    private var hoverPresence = ChartHoverPresence()
+    private var chartPanelAnchorID: String?
+    private var chartPanelHiding = false
+    private var chartPanelSlide: CGFloat = 12
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
+        NSApp.setActivationPolicy(CommandLine.arguments.contains("--show-popover") ? .regular : .accessory)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
             button.target = self
@@ -401,6 +406,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         store.refresh()
+        if CommandLine.arguments.contains("--show-popover") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.togglePopover() }
+        }
         if CommandLine.arguments.contains("--preview") {
             Preview.captureWhenReady(store: store, attempts: 40)
         }
@@ -449,7 +457,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let controller = NSHostingController(rootView: PopoverView(
             store: store,
             openID: UUID(),
-            onHoverChange: { [weak self] hovering, days in self?.chartHoverChanged(hovering, days: days) }
+            onHoverChange: { [weak self] rowID, hovering, days, anchor in
+                self?.chartHoverChanged(rowID: rowID, hovering: hovering, days: days, anchor: anchor)
+            }
         ))
         if #available(macOS 13.0, *) {
             controller.sizingOptions = [.preferredContentSize]
@@ -459,29 +469,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }
         NSApp.activate(ignoringOtherApps: true)
+        popover.contentViewController?.view.window?.makeKey()
         store.refresh()
     }
 
-    private func chartHoverChanged(_ hovering: Bool, days: [UIModel.Day]) {
+    private func chartHoverChanged(rowID: String, hovering: Bool, days: [UIModel.Day], anchor: NSRect) {
+        hoverLog("row hover=\(hovering) days=\(days.count)")
         if hovering && days.count > 1 {
+            hoverPresence.rowID = rowID
             cancelHide()
-            showChartPanel(days: days)
-        } else {
+            showChartPanel(rowID: rowID, days: days, anchor: anchor)
+        } else if hoverPresence.rowID == rowID {
+            hoverPresence.leaveRow(rowID)
             scheduleHide()
         }
     }
 
     private func panelHoverChanged(_ hovering: Bool) {
-        if hovering {
-            cancelHide()
-        } else {
-            scheduleHide()
-        }
+        hoverPresence.panel = hovering
+        if hovering { cancelHide() } else { scheduleHide() }
     }
 
     private func scheduleHide() {
         cancelHide()
-        let item = DispatchWorkItem { [weak self] in self?.hideChartPanel() }
+        guard hoverPresence.shouldHide else { return }
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.hoverPresence.shouldHide else { return }
+            self.hideChartPanel()
+        }
         hideWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.28, execute: item)
     }
@@ -491,68 +506,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hideWorkItem = nil
     }
 
-    private func showChartPanel(days: [UIModel.Day]) {
+    private func showChartPanel(rowID: String, days: [UIModel.Day], anchor: NSRect) {
+        hoverLog("showChartPanel days=\(days.count) panel=\(chartPanel != nil)")
         guard days.count > 1,
               let popoverWindow = popover.contentViewController?.view.window else { return }
-        let size = NSSize(width: 320, height: 190)
+        let size = UsageChartPanel.size
         let visible = (popoverWindow.screen ?? NSScreen.main)?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        // Sit next to the sparkline, never on top of it: a panel that covers
-        // the trigger ends the hover the moment it appears.
-        let gap: CGFloat = 8
-        var x = popoverWindow.frame.maxX + gap
-        if x + size.width > visible.maxX {
-            x = popoverWindow.frame.minX - gap - size.width
-        }
-        x = max(visible.minX + 8, min(x, visible.maxX - size.width))
-        let panelTop = popoverWindow.frame.maxY - 150
-        var y = panelTop - size.height
-        y = max(y, visible.minY + 8)
-        let finalFrame = NSRect(origin: NSPoint(x: x, y: y), size: size)
+        let frame = chartPanelFrame(size: size, anchor: anchor,
+                               popover: popoverWindow.frame, visible: visible)
 
         let panel: NSPanel
         if let existing = chartPanel {
             panel = existing
         } else {
-            panel = NSPanel(contentRect: finalFrame,
-                            styleMask: [.borderless, .nonactivatingPanel],
-                            backing: .buffered,
-                            defer: false)
-            panel.isOpaque = false
-            panel.backgroundColor = .clear
-            panel.hasShadow = false
-            panel.level = .popUpMenu
-            panel.collectionBehavior = [.transient, .ignoresCycle]
-            panel.hidesOnDeactivate = false
-            panel.isMovable = false
-            panel.isReleasedWhenClosed = false
-            panel.acceptsMouseMovedEvents = true
+            panel = UsageChartPanel(frame: frame, state: chartPanelState) { [weak self] hovering in
+                self?.panelHoverChanged(hovering)
+            }
             chartPanel = panel
         }
-        if panel.contentView == nil {
-            let hosting = NSHostingView(rootView: ChartPanelView(state: chartPanelState) { [weak self] hovering in
-                self?.panelHoverChanged(hovering)
-            })
-            hosting.frame = NSRect(origin: .zero, size: size)
-            panel.contentView = hosting
-        }
-        chartPanelState.days = days
-        if panel.isVisible {
-            panelGeneration += 1
-            panel.alphaValue = 1
-            panel.setFrame(finalFrame, display: true)
-            return
-        }
+        if chartPanelState.days != days { chartPanelState.days = days }
+        let hidden = !panel.isVisible
+        let switchedRow = chartPanelAnchorID != rowID
+        // Repeated enters/data updates must not cancel an in-flight entrance.
+        guard hidden || switchedRow || chartPanelHiding else { return }
+        chartPanelHiding = false
+        chartPanelAnchorID = rowID
+        chartPanelSlide = frame.midX < popoverWindow.frame.midX ? -12 : 12
+        panel.appearance = popoverWindow.effectiveAppearance
+        if hidden || switchedRow { chartPanelState.presentationID = UUID() }
         panelGeneration += 1
-        let startFrame = NSRect(origin: NSPoint(x: finalFrame.origin.x + 24, y: finalFrame.origin.y),
-                                size: size)
-        panel.setFrame(startFrame, display: false)
-        panel.alphaValue = 0
-        panel.orderFront(nil)
+        if hidden {
+            panel.setFrame(frame.offsetBy(dx: chartPanelSlide, dy: 0), display: false)
+            panel.alphaValue = 0
+            panel.orderFront(nil)
+        }
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.18
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            panel.animator().setFrame(finalFrame, display: true)
+            panel.animator().setFrame(frame, display: true)
             panel.animator().alphaValue = 1
         }
     }
@@ -560,9 +552,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func hideChartPanel() {
         hideWorkItem = nil
         guard let panel = chartPanel, panel.isVisible else { return }
-        let frame = panel.frame
-        let target = NSRect(origin: NSPoint(x: frame.origin.x + 20, y: frame.origin.y),
-                            size: frame.size)
+        chartPanelHiding = true
+        let target = panel.frame.offsetBy(dx: chartPanelSlide, dy: 0)
         panelGeneration += 1
         let generation = panelGeneration
         NSAnimationContext.runAnimationGroup { context in
@@ -574,6 +565,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor in
                 guard let self, self.panelGeneration == generation else { return }
                 panel.orderOut(nil)
+                self.chartPanelHiding = false
                 panel.alphaValue = 1
             }
         }
@@ -581,6 +573,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func hideChartPanelImmediately() {
         cancelHide()
+        hoverPresence = ChartHoverPresence()
+        chartPanelHiding = false
+        chartPanelAnchorID = nil
+        panelGeneration += 1
         chartPanel?.orderOut(nil)
     }
 
@@ -637,7 +633,7 @@ struct PopoverView: View {
     @ObservedObject var store: UsageStore
     let openID: UUID
     var animateBar = true
-    var onHoverChange: ((Bool, [UIModel.Day]) -> Void)?
+    var onHoverChange: ((String, Bool, [UIModel.Day], NSRect) -> Void)?
 
     var body: some View {
         let showCodex = store.settings.showCodex
@@ -774,8 +770,8 @@ struct PopoverView: View {
     private func summary(_ model: UIModel) -> some View {
         UsageSummaryView(tokensText: model.tokens?.text, tokensLabel: model.tokens?.label,
                          updated: model.updated,
-                         stale: model.stale, history: model.history, source: model.tokensSource) { hovering in
-            onHoverChange?(hovering, model.history)
+                         stale: model.stale, history: model.history, source: model.tokensSource) { hovering, anchor in
+            onHoverChange?(openID.uuidString + "-codex", hovering, model.history, anchor)
         }
         .help("额度来源：\(model.source)。" + (model.tokensNote ?? "本机日志估算，按本机时区统计。"))
     }
@@ -802,7 +798,7 @@ struct UsageSummaryView: View {
     var stale = false
     let history: [UIModel.Day]
     var source: String? = nil
-    var onHover: ((Bool) -> Void)?
+    var onHover: ((Bool, NSRect) -> Void)?
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 10) {
@@ -833,12 +829,147 @@ struct UsageSummaryView: View {
             }
         }
         .contentShape(Rectangle())
-        .onHover { onHover?($0) }
+        .overlay(HoverTracking(debugTag: "row") { onHover?($0, $1) })
+    }
+}
+
+// Fixed to the summary/mini-chart top edge, independent of cursor position.
+func chartPanelFrame(size: NSSize, anchor: NSRect, popover: NSRect, visible: NSRect) -> NSRect {
+    let gap: CGFloat = 2
+    let margin: CGFloat = 8
+    var y = anchor.maxY - size.height
+    y = max(visible.minY + margin, min(y, visible.maxY - size.height - margin))
+
+    let right = popover.maxX + gap
+    if right + size.width <= visible.maxX - margin {
+        return NSRect(x: right, y: y, width: size.width, height: size.height)
+    }
+    let left = popover.minX - gap - size.width
+    if left >= visible.minX + margin {
+        return NSRect(x: left, y: y, width: size.width, height: size.height)
+    }
+    // No room on either side: drop below the popover, right-aligned.
+    var x = popover.maxX - size.width
+    x = max(visible.minX + margin, min(x, visible.maxX - size.width - margin))
+    let below = popover.minY - gap - size.height
+    return NSRect(x: x, y: max(visible.minY + margin, below),
+                  width: size.width, height: size.height)
+}
+
+struct ChartHoverPresence {
+    var rowID: String?
+    var panel = false
+    var shouldHide: Bool { rowID == nil && !panel }
+
+    mutating func leaveRow(_ id: String) {
+        if rowID == id { rowID = nil }
+    }
+}
+
+final class HoverTrackingView: NSView {
+    var onHover: ((Bool, NSRect) -> Void)?
+    var debugTag = "view"
+    private var area: NSTrackingArea?
+    private(set) var isInside = false
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.acceptsMouseMovedEvents = true
+        updateTrackingAreas()
+        refreshHover()
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil { report(false) }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let area { removeTrackingArea(area) }
+        let area = NSTrackingArea(rect: .zero,
+                                 options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
+                                 owner: self, userInfo: nil)
+        addTrackingArea(area)
+        self.area = area
+        refreshHover()
+    }
+
+    func refreshHover(repeatInside: Bool = false) {
+        DispatchQueue.main.async { [weak self] in
+            self?.updateHover(atScreenPoint: NSEvent.mouseLocation, repeatInside: repeatInside)
+        }
+    }
+
+    func updateHover(atScreenPoint point: NSPoint, repeatInside: Bool = false) {
+        guard let window, window.isVisible, !isHiddenOrHasHiddenAncestor else {
+            report(false)
+            return
+        }
+        let local = convert(window.convertPoint(fromScreen: point), from: nil)
+        report(visibleRect.contains(local), repeatInside: repeatInside)
+    }
+
+    private func report(_ inside: Bool, repeatInside: Bool = false) {
+        guard inside != isInside || (inside && repeatInside) else { return }
+        isInside = inside
+        hoverLog("\(debugTag) hover=\(inside)")
+        let frame = window.map { $0.convertToScreen(convert(bounds, to: nil)) } ?? .zero
+        onHover?(inside, frame)
+    }
+
+    override func mouseEntered(with event: NSEvent) { report(true) }
+    override func mouseExited(with event: NSEvent) { report(false) }
+    override func mouseMoved(with event: NSEvent) {
+        updateHover(atScreenPoint: NSEvent.mouseLocation)
+    }
+}
+
+struct HoverTracking: NSViewRepresentable {
+    var debugTag = "view"
+    let onHover: (Bool, NSRect) -> Void
+
+    func makeNSView(context: Context) -> HoverTrackingView {
+        let view = HoverTrackingView()
+        view.onHover = onHover
+        view.debugTag = debugTag
+        return view
+    }
+
+    func updateNSView(_ view: HoverTrackingView, context: Context) {
+        view.onHover = onHover
+        view.debugTag = debugTag
+        // New usage can arrive while the pointer has stayed inside the row.
+        view.refreshHover(repeatInside: true)
     }
 }
 
 final class ChartPanelState: ObservableObject {
     @Published var days: [UIModel.Day] = []
+    @Published var presentationID = UUID()
+}
+
+final class UsageChartPanel: NSPanel {
+    static let size = NSSize(width: 300, height: 170)
+    init(frame: NSRect, state: ChartPanelState, onHover: @escaping (Bool) -> Void) {
+        super.init(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel],
+                   backing: .buffered, defer: false)
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        level = .popUpMenu
+        collectionBehavior = [.transient, .ignoresCycle]
+        hidesOnDeactivate = false
+        isMovable = false
+        isReleasedWhenClosed = false
+        acceptsMouseMovedEvents = true
+        // NSPanel already has an empty contentView; always install the chart.
+        let hosting = NSHostingView(rootView: ChartPanelView(state: state, onHover: onHover))
+        hosting.frame = NSRect(origin: .zero, size: frame.size)
+        contentView = hosting
+    }
 }
 
 struct ChartPanelView: View {
@@ -848,10 +979,10 @@ struct ChartPanelView: View {
 
     var body: some View {
         UsageChartCard(days: state.days, previewIndex: previewIndex)
-            .padding(10)
-            .frame(width: 320, height: 190)
+            .id(state.presentationID)
+            .frame(width: UsageChartPanel.size.width, height: UsageChartPanel.size.height)
             .contentShape(Rectangle())
-            .onHover(perform: onHover)
+            .overlay(HoverTracking(debugTag: "panel") { inside, _ in onHover(inside) })
     }
 }
 
@@ -907,7 +1038,7 @@ struct OpenCodeCard: View {
     @ObservedObject var store: UsageStore
     let openID: UUID
     var animateBar = true
-    var onHoverChange: ((Bool, [UIModel.Day]) -> Void)?
+    var onHoverChange: ((String, Bool, [UIModel.Day], NSRect) -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1057,8 +1188,8 @@ struct OpenCodeCard: View {
         let updated = model.updated.map { formatter.string(from: Date(timeIntervalSince1970: $0)) } ?? "—"
         let history = stats.history ?? []
         return UsageSummaryView(tokensText: stats.todayText ?? "—", updated: updated,
-                                history: history, source: "本机统计") { hovering in
-            onHoverChange?(hovering, history)
+                                history: history, source: "本机统计") { hovering, anchor in
+            onHoverChange?(openID.uuidString + "-opencode", hovering, history, anchor)
         }
         .help(stats.error ?? "近 \(model.days ?? 7) 日合计：\(stats.totalText) tokens · 趋势为近 7 日 · \(statsSubtitle(stats))")
     }
@@ -1237,13 +1368,13 @@ struct UsageChartCard: View {
                         .fill(active ? Color.primary.opacity(0.06)
                               : isToday ? Color.primary.opacity(0.03) : Color.clear))
                     .contentShape(Rectangle())
-                    .onHover { inside in
+                    .overlay(HoverTracking(debugTag: "day") { inside, _ in
                         if inside {
-                            hover.index = index
+                            if hover.index != index { hover.index = index }
                         } else if hover.index == index {
                             hover.index = nil
                         }
-                    }
+                    })
                 }
             }
             .animation(.spring(response: 0.32, dampingFraction: 0.72), value: hover.index)
@@ -1255,15 +1386,11 @@ struct UsageChartCard: View {
             }
         }
         .padding(12)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(.regularMaterial)
-                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(Color.primary.opacity(0.07)))
-        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(VisualEffectView())
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
             .strokeBorder(Color.primary.opacity(0.14), lineWidth: 0.5))
-        .shadow(color: .black.opacity(0.22), radius: 12, y: 5)
     }
 
     private func dayDetail(_ day: UIModel.Day) -> String {
@@ -1377,7 +1504,7 @@ enum Preview {
         workspace: "Team",
         usageUrl: nil,
         goMeters: [
-            .init(key: "rolling", label: "滚动额度", used: 42, remaining: 58, amount: 58,
+            .init(key: "rolling", label: "5 小时额度", used: 42, remaining: 58, amount: 58,
                   limited: false, resetsAt: nil, resetText: "3小时12分后重置", resetClock: nil),
             .init(key: "weekly", label: "每周额度", used: 20, remaining: 80, amount: 80,
                   limited: false, resetsAt: nil, resetText: nil, resetClock: nil),
@@ -1441,7 +1568,7 @@ enum Preview {
         let state = ChartPanelState()
         state.days = days
         let hosting = NSHostingView(rootView: ChartPanelView(state: state) { _ in })
-        hosting.frame = NSRect(x: 0, y: 0, width: 320, height: 190)
+        hosting.frame = NSRect(origin: .zero, size: UsageChartPanel.size)
         let window = NSWindow(contentRect: hosting.frame,
                               styleMask: [.borderless],
                               backing: .buffered,
@@ -1500,6 +1627,12 @@ enum Preview {
 }
 
 // MARK: - Entry point
+
+private let hoverLogger = Logger(subsystem: "local.codexusage.menubar", category: "Hover")
+
+func hoverLog(_ line: String) {
+    hoverLogger.debug("\(line, privacy: .public)")
+}
 
 @main
 struct CodexUsageApp: App {
