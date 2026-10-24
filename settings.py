@@ -37,7 +37,7 @@ def validate(raw):
                 'opencode_show_stats', 'opencode_show_cost'):
         if not isinstance(result[key], bool):
             raise ValueError(f'无效设置：{key}')
-    for key in ('refresh_minutes', 'stale_minutes', 'low_quota_threshold'):
+    for key in ('refresh_minutes', 'stale_minutes', 'low_quota_threshold', 'opencode_days'):
         if type(result[key]) is not int:
             raise ValueError(f'无效设置：{key}')
     if not isinstance(result['opencode_cli'], str):

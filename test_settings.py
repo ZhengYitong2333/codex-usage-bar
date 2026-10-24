@@ -80,3 +80,8 @@ class ProviderSettingsTests(unittest.TestCase):
             saved = settings.read(config)
             self.assertFalse(saved['show_codex'])
             self.assertTrue(saved['show_opencode'])
+
+    def test_opencode_days_must_be_an_integer(self):
+        with self.assertRaises(ValueError):
+            settings.validate({'opencode_days': 7.0})
+        self.assertEqual(settings.validate({'opencode_days': 30})['opencode_days'], 30)

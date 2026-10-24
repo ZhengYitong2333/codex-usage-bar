@@ -1,4 +1,5 @@
 import datetime as dt
+import http.client
 import json
 import sqlite3
 import tempfile
@@ -105,15 +106,19 @@ class OpenCodeLoginTests(unittest.TestCase):
                                             'metadata': {'orgID': 'org-1'}}), 1),
                 ])
             with patch.dict('os.environ', {'XDG_DATA_HOME': folder}):
-                self.assertEqual(opencode_usage.console_credential('opencode-go')['token'], 'go-key')
-                self.assertEqual(opencode_usage.console_credential()['token'], 'console-token')
-                self.assertEqual(opencode_usage.console_credential()['org_id'], 'org-1')
+                go, go_status = opencode_usage.console_credential('opencode-go')
+                console, console_status = opencode_usage.console_credential()
+                self.assertEqual(go['token'], 'go-key')
+                self.assertEqual(go_status, 'ok')
+                self.assertEqual(console['token'], 'console-token')
+                self.assertEqual(console['org_id'], 'org-1')
+                self.assertEqual(console_status, 'ok')
 
     def test_go_key_queries_usage_without_console_budgets(self):
         credential = {'token': 'go-key'}
         usage = {'rolling': {'percent': 25}}
         with patch.object(opencode_usage, 'console_credential',
-                          side_effect=lambda integration='opencode': credential if integration == 'opencode-go' else None), \
+                          side_effect=lambda integration='opencode': (credential, 'ok') if integration == 'opencode-go' else (None, 'signed_out')), \
              patch.object(opencode_usage, 'console_request', return_value={'usage': usage}) as request:
             payload, status = opencode_usage.console_limits()
         self.assertEqual(status, 'ok')
@@ -126,7 +131,7 @@ class OpenCodeLoginTests(unittest.TestCase):
         console = {'token': 'console-token', 'org_id': 'org-1'}
         go = {'token': 'go-key'}
         with patch.object(opencode_usage, 'console_credential',
-                          side_effect=lambda integration='opencode': go if integration == 'opencode-go' else console), \
+                          side_effect=lambda integration='opencode': (go, 'ok') if integration == 'opencode-go' else (console, 'ok')), \
              patch.object(opencode_usage, 'console_request',
                           side_effect=[{'usage': {'rolling': {'percent': 25}}}, []]) as request:
             _, status = opencode_usage.console_limits()
@@ -135,13 +140,13 @@ class OpenCodeLoginTests(unittest.TestCase):
         self.assertEqual(request.call_args_list[1].args[1], console)
 
     def test_no_credentials_is_signed_out(self):
-        with patch.object(opencode_usage, 'console_credential', return_value=None), \
+        with patch.object(opencode_usage, 'console_credential', return_value=(None, 'signed_out')), \
              patch.object(opencode_usage, 'console_request') as request:
             self.assertEqual(opencode_usage.console_limits(), (None, 'signed_out'))
         request.assert_not_called()
 
     def test_credentials_without_usage_are_not_signed_out(self):
-        with patch.object(opencode_usage, 'console_credential', return_value={'token': 'test'}), \
+        with patch.object(opencode_usage, 'console_credential', return_value=({'token': 'test'}, 'ok')), \
              patch.object(opencode_usage, 'console_request', return_value={}):
             self.assertEqual(opencode_usage.console_limits(), (None, 'unavailable'))
 
@@ -261,3 +266,44 @@ class OpenCodeHistoryTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class OpenCodeResilienceTests(unittest.TestCase):
+    def test_truncated_response_does_not_escape(self):
+        with patch.object(opencode_usage.urllib.request, 'urlopen',
+                          side_effect=http.client.IncompleteRead(b'{"usage"')):
+            with self.assertRaises(opencode_usage.OpenCodeError):
+                opencode_usage.console_request('https://opencode.ai/zen/go/v1/usage', {'token': 'x'})
+
+    def test_malformed_stats_payload_reads_as_zero(self):
+        model = opencode_usage.normalize({'tokens': {'input': 'n/a'}, 'sessions': 'x'}, None, 7,
+                                          'remaining', now=1)
+        self.assertEqual(model['stats']['total'], 0)
+        self.assertEqual(model['stats']['sessions'], 0)
+
+    def test_unreadable_credential_db_is_not_signed_out(self):
+        with patch.object(opencode_usage, 'console_credential', return_value=(None, 'unreadable')):
+            self.assertEqual(opencode_usage.console_limits()[1], 'unreadable')
+
+    def test_expired_credential_still_offers_the_login_button(self):
+        with patch.object(opencode_usage, 'console_credential', return_value=({'token': 'x'}, 'ok')), \
+             patch.object(opencode_usage, 'console_request',
+                          side_effect=opencode_usage.OpenCodeError('OpenCode 登录凭据已失效，请重新登录')):
+            self.assertEqual(opencode_usage.console_limits()[1], 'signed_out')
+
+    def test_history_reuses_the_window_already_fetched(self):
+        now = 1_800_000_000
+        today = dt.datetime.fromtimestamp(now).date()
+        calls = []
+        def fake_read(binary, days=7, timeout=45):
+            calls.append(days)
+            day = today - dt.timedelta(days=days - 1)
+            midnight = dt.datetime.combine(day, dt.time()).timestamp()
+            return {'tokens': {'input': days * 10}, 'range': {'from': midnight * 1000}}
+        day7 = today - dt.timedelta(days=6)
+        midnight7 = dt.datetime.combine(day7, dt.time()).timestamp()
+        known = {7: {'tokens': {'input': 70}, 'range': {'from': midnight7 * 1000}}}
+        with patch.object(opencode_usage, 'read_stats', side_effect=fake_read):
+            history = opencode_usage.read_history('/test/opencode', now=now, known=known)
+        self.assertNotIn(7, calls)
+        self.assertEqual(len(history), 7)

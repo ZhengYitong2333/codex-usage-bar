@@ -13,6 +13,7 @@ import shutil
 import sqlite3
 import subprocess
 import time
+import http.client
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -125,6 +126,8 @@ def usage_limits(timeout=8):
         if error.code == 404:
             return None, 'unsupported'  # This OpenCode release has no limits route.
         raise OpenCodeError('OpenCode 额度接口暂时不可用') from None
+    except http.client.HTTPException:
+        return None, 'unavailable'
     except (urllib.error.URLError, OSError, ValueError):
         return None, 'unavailable'
 
@@ -135,11 +138,14 @@ def console_credential(integration="opencode"):
     OpenCode keeps integration credentials in its local database. Reading it
     here only fills the Authorization header of the user's own Console
     requests; the value is never logged, stored, or shown.
+
+    Returns (credential, status) where status is "ok", "signed_out" or
+    "unreadable", so a locked database is not reported as a missing sign-in.
     """
     data_home = Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share')))
     database = data_home / 'opencode' / 'opencode.db'
     if not database.is_file():
-        return None
+        return None, 'signed_out'
     try:
         connection = sqlite3.connect(f'file:{database}?mode=ro', uri=True, timeout=2)
         try:
@@ -148,7 +154,7 @@ def console_credential(integration="opencode"):
         finally:
             connection.close()
     except sqlite3.Error:
-        return None
+        return None, 'unreadable'
     for integration_id, raw, active in rows:
         if integration_id != integration or not active:
             continue
@@ -164,8 +170,8 @@ def console_credential(integration="opencode"):
             continue
         return {'token': token, 'org_id': metadata.get('orgID'),
                 'org_name': metadata.get('orgName'),
-                'server': metadata.get('server')}
-    return None
+                'server': metadata.get('server')}, 'ok'
+    return None, 'signed_out'
 
 
 def console_server(credential):
@@ -197,6 +203,8 @@ def console_request(url, credential, timeout=8, org_header='x-org-id'):
         if error.code == 403:
             raise OpenCodeError('OpenCode 额度查询被拒绝（HTTP 403），请检查 Go 订阅或访问权限') from None
         raise OpenCodeError('OpenCode Console 额度接口暂时不可用') from None
+    except http.client.HTTPException:
+        raise OpenCodeError('OpenCode 额度响应不完整，请稍后重试') from None
     except (urllib.error.URLError, OSError, ValueError):
         raise OpenCodeError('OpenCode 额度查询失败，请稍后重试') from None
 
@@ -207,10 +215,13 @@ def console_limits(timeout=8):
     OpenCode releases before 2.2 do not expose the local limits route, so the
     same two Console endpoints the CLI uses are called directly.
     """
-    credential = console_credential()
-    go_credential = console_credential('opencode-go') or credential
+    credential, credential_status = console_credential()
+    go_credential, go_status = console_credential('opencode-go')
     if go_credential is None:
-        return None, 'signed_out'
+        go_credential = credential
+        go_status = credential_status
+    if go_credential is None:
+        return None, go_status
     payload = {'workspace': None, 'go': None, 'budgets': []}
     error = None
     server = console_server(go_credential)
@@ -222,6 +233,8 @@ def console_limits(timeout=8):
             payload['go'] = usage['usage']
     except OpenCodeError as exc:
         error = exc
+        if '凭据已失效' in str(exc):
+            return None, 'signed_out'
 
     # Go provider keys authorize Go usage, not Console workspace budgets.
     if credential is not None:
@@ -277,8 +290,11 @@ def token_counts(stats):
             'tokens': int(sum(values))}
 
 
-def read_history(binary, now, timeout=45):
-    """Derive calendar-day tokens from CLI cumulative calendar-day windows."""
+def read_history(binary, now, timeout=45, known=None):
+    """Derive calendar-day tokens from CLI cumulative calendar-day windows.
+
+    `known` carries the window already fetched so it is not queried twice.
+    """
     today = dt.datetime.fromtimestamp(now).date()
     deadline = time.monotonic() + timeout
     previous = dict.fromkeys(('input_tokens', 'output_tokens', 'tokens'), 0)
@@ -287,7 +303,7 @@ def read_history(binary, now, timeout=45):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise OpenCodeError('OpenCode 每日统计查询超时')
-        stats = read_stats(binary, days=days, timeout=remaining)
+        stats = known.get(days) if known and days in known else read_stats(binary, days=days, timeout=remaining)
         day = today - dt.timedelta(days=days - 1)
         window = stats.get('range')
         start = timestamp(window.get('from')) if isinstance(window, dict) else None
@@ -343,23 +359,32 @@ def budget(label, raw, now):
     }
 
 
+def count(value, default=0):
+    """A count from untrusted CLI output; anything unexpected reads as zero."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    if isinstance(value, float) and (value != value or value in (float('inf'), float('-inf'))):
+        return default
+    return int(value)
+
+
 def normalize(stats, limits, days, display, now,
               show_go=True, show_rolling=True, show_weekly=True, show_monthly=True,
               show_stats=True, show_cost=True):
     tokens = stats.get('tokens') if isinstance(stats.get('tokens'), dict) else {}
     cache = tokens.get('cache') if isinstance(tokens.get('cache'), dict) else {}
     values = {
-        'input': int(tokens.get('input') or 0),
-        'output': int(tokens.get('output') or 0),
-        'reasoning': int(tokens.get('reasoning') or 0),
-        'cache_read': int(cache.get('read') or 0),
-        'cache_write': int(cache.get('write') or 0),
+        'input': count(tokens.get('input')),
+        'output': count(tokens.get('output')),
+        'reasoning': count(tokens.get('reasoning')),
+        'cache_read': count(cache.get('read')),
+        'cache_write': count(cache.get('write')),
     }
     total = sum(values.values())
     activity = []
     for item in stats.get('activity') or []:
         if isinstance(item, dict) and isinstance(item.get('date'), str) and number(item.get('steps')):
-            activity.append({'date': item['date'], 'steps': int(item['steps'])})
+            activity.append({'date': item['date'], 'steps': count(item['steps'])})
     peak = max([item['steps'] for item in activity] + [1])
     for item in activity:
         item['level'] = min(4, round(item['steps'] / peak * 4)) if item['steps'] else 0
@@ -381,9 +406,9 @@ def normalize(stats, limits, days, display, now,
             'input_text': compact(values['input']),
             'output_text': compact(values['output']),
             'cost': float(stats['cost']) if number(stats.get('cost')) else None,
-            'sessions': int(stats.get('sessions') or 0),
-            'active_days': int(stats.get('activeDays') or 0),
-            'streak': int(stats.get('streak') or 0),
+            'sessions': count(stats.get('sessions')),
+            'active_days': count(stats.get('activeDays')),
+            'streak': count(stats.get('streak')),
             'activity': activity,
         },
         'updated': time.time(),
@@ -454,7 +479,8 @@ def query(days=7, display='remaining', timeout=45, cli=None,
     result['error'] = error
     if result['stats'] is not None:
         try:
-            result['stats']['history'] = read_history(binary, now, timeout=timeout)
+            known = {days: stats} if days == 7 else None
+            result['stats']['history'] = read_history(binary, now, timeout=timeout, known=known)
             result['stats']['today_text'] = result['stats']['history'][-1]['text']
         except OpenCodeError as exc:
             result['stats']['history'] = []
