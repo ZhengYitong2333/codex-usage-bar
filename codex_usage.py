@@ -129,7 +129,11 @@ def account_tokens(daily, now):
     history = [{'date': day.strftime('%m-%d'), 'tokens': daily.get(day, 0),
                 'available': day in daily, 'input_tokens': None, 'output_tokens': None,
                 'text': compact_tokens(daily[day]) if day in daily else '—'} for day in days]
-    return {'today': {'total_tokens': daily.get(today)}, 'history': history}
+    # The account API lags by a day, so name the day the numbers belong to.
+    synced = [day for day in daily if day <= today]
+    last = max(synced) if synced else None
+    return {'today': {'total_tokens': daily.get(today)}, 'history': history,
+            'last_synced': {'date': last.strftime('%m-%d'), 'tokens': daily[last]} if last else None}
 
 
 def local_time(value):
@@ -238,6 +242,7 @@ def ui_model(data, settings=None):
         'tokens': None,
         'history': [],
         'tokens_source': data.get('tokens_source', '本机统计'),
+        'tokens_label': None,
         'tokens_note': data.get('tokens_note'),
         'details': [],
         'error': data.get('quota_error'),
@@ -253,7 +258,12 @@ def ui_model(data, settings=None):
                  ('label_size', 'value_size', 'weight', 'width', 'value_offset')},
     }
     if settings['show_tokens']:
-        model['tokens'] = {'text': compact_tokens(tokens) if tokens is not None else '待同步', 'raw': tokens}
+        label = None
+        if tokens is None and data.get('last_synced'):
+            label = data['last_synced']['date']
+            tokens = data['last_synced']['tokens']
+        model['tokens'] = {'text': compact_tokens(tokens) if tokens is not None else '待同步',
+                           'raw': tokens, 'label': label}
         model['history'] = data.get('history', [])
     if latest:
         limits = quota_windows(latest['limits'])
@@ -354,7 +364,9 @@ def summary(data, settings=None):
             lines.append(f"  {window['label']}  {window['status']}"
                          + (f"（{window['reason']}）" if window['reason'] else ''))
     if model['tokens']:
-        lines.append(f"  今日 tokens {model['tokens']['text']}（{model['tokens_source']}）")
+        label = model['tokens'].get('label')
+        lines.append(f"  {label + ' ' if label else '今日 '}tokens {model['tokens']['text']}"
+                     f"（{model['tokens_source']}）")
     lines.append(f"  来源 {model['source']} · 更新于 {model['updated']}")
     if model['error']:
         lines.append(f"  查询失败：{model['error']}")

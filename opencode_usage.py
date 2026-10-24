@@ -340,7 +340,7 @@ def meter(key, label, raw, now, display):
 def budget(label, raw, now):
     if not isinstance(raw, dict):
         return None
-    # The local service route reports limit/spent; the Console API reports dollars.
+    # Both routes report US dollars; only the field names differ.
     limit = raw.get('limit', raw.get('limitDollars'))
     spent = raw.get('spent', raw.get('spentDollars'))
     if not number(limit) or float(limit) <= 0:

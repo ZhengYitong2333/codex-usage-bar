@@ -64,6 +64,9 @@ struct Preferences: Codable, Equatable {
 
     func canSelect(_ window: String) -> Bool { availableWindows.contains(window) }
 
+    /// Set while the user changes the window, so a late probe does not override it.
+    var windowPickedDuringProbe = false
+
     func refreshAvailability() async {
         let script = support.appendingPathComponent("codex_usage.py").path
         let result: Set<String>? = await Task.detached {
@@ -84,6 +87,8 @@ struct Preferences: Codable, Equatable {
         availabilityKnown = true
         availableWindows = result
         guard !result.isEmpty, !result.contains(draft.window) else { return }
+        // The user may have picked a window while this probe was running.
+        guard !windowPickedDuringProbe else { return }
         draft.window = result.contains("primary") ? "primary" : "secondary"
         message = "所选额度暂无数据，已切换为\(draft.window == "primary" ? "5 小时" : "每周")；请保存"
     }

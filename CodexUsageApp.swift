@@ -29,6 +29,7 @@ struct UIModel: Codable, Equatable {
     struct Tokens: Codable, Equatable {
         var text: String
         var raw: Int?
+        var label: String?
     }
 
     struct Day: Codable, Equatable, Identifiable {
@@ -49,7 +50,6 @@ struct UIModel: Codable, Equatable {
         var valueOffset: Double?
     }
 
-    var title: String
     var tooltip: String
     var iconValue: String
     var stale: Bool
@@ -61,13 +61,11 @@ struct UIModel: Codable, Equatable {
     var history: [Day]
     var tokensSource: String?
     var tokensNote: String?
-    var details: [String]
+    var tokensLabel: String?
     var updated: String
     var error: String?
     var authRequired: Bool?
     var source: String
-    var refreshMinutes: Int
-    var queryEnabled: Bool
     var mode: String
     var showCodex: Bool
     var showOpenCode: Bool
@@ -148,6 +146,39 @@ struct OpenCodeModel: Codable, Equatable {
 
 // MARK: - Data loading
 
+/// The settings the menu bar app needs, read from the shared settings file.
+///
+/// The card visibility and the refresh interval must not depend on a query
+/// succeeding, so they come from disk rather than from a payload.
+@MainActor
+final class AppSettings: ObservableObject {
+    @Published private(set) var showCodex = true
+    @Published private(set) var showOpenCode = true
+    @Published private(set) var refreshMinutes = 5
+    @Published private(set) var menuBarItems: [MenuBarMetric] = [.codex]
+    @Published private(set) var opencodeCLIPath = ""
+
+    private let file = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/CodexUsage/settings.json")
+
+    init() {
+        reload()
+    }
+
+    func reload() {
+        guard let data = try? Data(contentsOf: file),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        if let value = object["show_codex"] as? Bool { showCodex = value }
+        if let value = object["show_opencode"] as? Bool { showOpenCode = value }
+        if let value = object["refresh_minutes"] as? Int, value > 0 { refreshMinutes = value }
+        if let path = object["opencode_cli"] as? String { opencodeCLIPath = path }
+        if let items = object["menu_bar_items"] as? [String] {
+            let metrics = items.compactMap(MenuBarMetric.init(rawValue:))
+            if !metrics.isEmpty { menuBarItems = metrics }
+        }
+    }
+}
+
 @MainActor
 final class UsageStore: ObservableObject {
     @Published var model: UIModel?
@@ -162,24 +193,8 @@ final class UsageStore: ObservableObject {
     private var loadingOpenCode = false
     private let script = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/CodexUsage/codex_usage.py")
-    private let settingsFile = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/CodexUsage/settings.json")
+    let settings = AppSettings()
 
-    /// The OpenCode CLI path chosen in settings, empty when it is auto-detected.
-    var opencodeCLIPath: String {
-        guard let data = try? Data(contentsOf: settingsFile),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let path = object["opencode_cli"] as? String else { return "" }
-        return path.trimmingCharacters(in: .whitespaces)
-    }
-
-    var menuBarItems: [MenuBarMetric] {
-        guard let data = try? Data(contentsOf: settingsFile),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let items = object["menu_bar_items"] as? [String] else { return [.codex] }
-        let metrics = items.compactMap(MenuBarMetric.init(rawValue:))
-        return metrics.isEmpty ? [.codex] : metrics
-    }
 
     func refresh() {
         onModel?(model)
@@ -316,7 +331,9 @@ enum StatusIcon {
         let valueFont = NSFont.systemFont(ofSize: CGFloat(icon?.valueSize ?? 12), weight: weight)
         let labelAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: NSColor.black, .font: labelFont]
         let valueAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: NSColor.black, .font: valueFont]
-        let labels = values.map { $0.label + ($0.stale ? " ·" : "") }
+        // Measure with the stale marker in place so the item does not resize.
+        let labels = values.map { $0.label + " ·" }
+        let drawn = values.map { $0.stale ? $0.label + " ·" : $0.label }
         let widths = zip(labels, values).map { label, value in
             max(CGFloat(icon?.width ?? 30), ceil(max((label as NSString).size(withAttributes: labelAttributes).width,
                                                     (value.value as NSString).size(withAttributes: valueAttributes).width)) + 2)
@@ -327,7 +344,7 @@ enum StatusIcon {
         image.lockFocus()
         var x: CGFloat = 0
         for index in values.indices {
-            let label = labels[index]
+            let label = drawn[index]
             let value = values[index].value
             let textWidth = max((label as NSString).size(withAttributes: labelAttributes).width,
                                 (value as NSString).size(withAttributes: valueAttributes).width)
@@ -353,6 +370,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var refreshTimer: Timer?
     private var settingsObserver: NSObjectProtocol?
     private var chartPanel: NSPanel?
+    private var chartPanelState = ChartPanelState()
     private var hideWorkItem: DispatchWorkItem?
     private var panelGeneration = 0
 
@@ -377,7 +395,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.store.refresh() }
+            Task { @MainActor in
+                self?.store.settings.reload()
+                self?.store.refresh()
+            }
         }
         store.refresh()
         if CommandLine.arguments.contains("--preview") {
@@ -396,10 +417,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func apply(_ model: UIModel?) {
-        let values = StatusIcon.values(metrics: store.menuBarItems, codex: model, openCode: store.opencode)
+        let values = StatusIcon.values(metrics: store.settings.menuBarItems, codex: model, openCode: store.opencode)
         statusItem.button?.image = StatusIcon.make(values: values, icon: model?.icon)
         statusItem.button?.toolTip = values.map(\.tooltip).joined(separator: "\n")
-        schedule(minutes: model?.refreshMinutes ?? 5)
+        statusItem.button?.setAccessibilityLabel(values.map(\.label).joined(separator: "、"))
+        statusItem.button?.setAccessibilityValue(values.map(\.value).joined(separator: "、"))
+        schedule(minutes: store.settings.refreshMinutes)
     }
 
     private func schedule(minutes: Int) {
@@ -499,11 +522,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             panel.acceptsMouseMovedEvents = true
             chartPanel = panel
         }
-        let hosting = NSHostingView(rootView: ChartPanelView(days: days) { [weak self] hovering in
-            self?.panelHoverChanged(hovering)
-        })
-        hosting.frame = NSRect(origin: .zero, size: size)
-        panel.contentView = hosting
+        if panel.contentView == nil {
+            let hosting = NSHostingView(rootView: ChartPanelView(state: chartPanelState) { [weak self] hovering in
+                self?.panelHoverChanged(hovering)
+            })
+            hosting.frame = NSRect(origin: .zero, size: size)
+            panel.contentView = hosting
+        }
+        chartPanelState.days = days
         if panel.isVisible {
             panelGeneration += 1
             panel.alphaValue = 1
@@ -607,8 +633,8 @@ struct PopoverView: View {
     var onHoverChange: ((Bool, [UIModel.Day]) -> Void)?
 
     var body: some View {
-        let showCodex = store.model?.showCodex ?? true
-        let showOpenCode = store.model?.showOpenCode ?? true
+        let showCodex = store.settings.showCodex
+        let showOpenCode = store.settings.showOpenCode
         VStack(alignment: .leading, spacing: 12) {
             if showCodex {
                 header
@@ -643,7 +669,7 @@ struct PopoverView: View {
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                     }
-                    hairline
+                    Hairline()
                     summary(model)
                 } else {
                     HStack(spacing: 8) {
@@ -655,22 +681,16 @@ struct PopoverView: View {
                 }
             }
             if showOpenCode {
-                if showCodex { hairline }
+                if showCodex { Hairline() }
                 OpenCodeCard(store: store, openID: openID, animateBar: animateBar,
                              onHoverChange: onHoverChange)
             }
-            hairline
+            Hairline()
             footer
         }
         .padding(16)
         .frame(width: 320, alignment: .leading)
         .background(VisualEffectView().ignoresSafeArea())
-    }
-
-    private var hairline: some View {
-        Rectangle()
-            .fill(Color.primary.opacity(0.10))
-            .frame(height: 0.5)
     }
 
     private var header: some View {
@@ -738,17 +758,19 @@ struct PopoverView: View {
             } else {
                 Text(window.status ?? "未提供")
                     .font(.system(size: 11.5))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
+                    .help(window.reason ?? "")
             }
         }
     }
 
     private func summary(_ model: UIModel) -> some View {
-        UsageSummaryView(tokensText: model.tokens?.text, updated: model.updated,
+        UsageSummaryView(tokensText: model.tokens?.text, tokensLabel: model.tokens?.label,
+                         updated: model.updated,
                          stale: model.stale, history: model.history, source: model.tokensSource) { hovering in
             onHoverChange?(hovering, model.history)
         }
-        .help(model.tokensNote ?? "本机日志估算，按本机时区统计。")
+        .help("额度来源：\(model.source)。" + (model.tokensNote ?? "本机日志估算，按本机时区统计。"))
     }
 
     private var footer: some View {
@@ -768,6 +790,7 @@ struct PopoverView: View {
 
 struct UsageSummaryView: View {
     let tokensText: String?
+    var tokensLabel: String? = nil
     let updated: String
     var stale = false
     let history: [UIModel.Day]
@@ -778,7 +801,9 @@ struct UsageSummaryView: View {
         HStack(alignment: .bottom, spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
                 if let tokensText {
-                    Text(tokensText == "待同步" ? "今日 tokens 待同步" : "今日 \(tokensText) tokens")
+                    Text(tokensText == "待同步"
+                         ? "tokens 待同步"
+                         : "\(tokensLabel ?? "今日") \(tokensText) tokens")
                         .font(.system(size: 11.5, weight: .medium))
                 }
                 HStack(spacing: 4) {
@@ -795,7 +820,7 @@ struct UsageSummaryView: View {
             Spacer(minLength: 6)
             if history.count > 1 {
                 VStack(alignment: .trailing, spacing: 2) {
-                    Text("近 7 日").font(.system(size: 9)).foregroundStyle(.tertiary)
+                    Text("近 7 日").font(.system(size: 9)).foregroundStyle(.secondary)
                     Sparkline(days: history)
                 }
             }
@@ -805,13 +830,17 @@ struct UsageSummaryView: View {
     }
 }
 
+final class ChartPanelState: ObservableObject {
+    @Published var days: [UIModel.Day] = []
+}
+
 struct ChartPanelView: View {
-    let days: [UIModel.Day]
+    @ObservedObject var state: ChartPanelState
     var previewIndex: Int? = nil
     let onHover: (Bool) -> Void
 
     var body: some View {
-        UsageChartCard(days: days, previewIndex: previewIndex)
+        UsageChartCard(days: state.days, previewIndex: previewIndex)
             .padding(10)
             .frame(width: 320, height: 190)
             .contentShape(Rectangle())
@@ -1010,7 +1039,7 @@ struct OpenCodeCard: View {
 
     /// The CLI to sign in with, honouring the configured path.
     private var loginCommand: String {
-        let configured = store.opencodeCLIPath
+        let configured = store.settings.opencodeCLIPath
         let binary = configured.isEmpty ? "opencode" : TerminalCommand.quote(configured)
         return "\(binary) auth login; echo '登录完成，可关闭此窗口'"
     }
@@ -1024,7 +1053,7 @@ struct OpenCodeCard: View {
                                 history: history, source: "本机统计") { hovering in
             onHoverChange?(hovering, history)
         }
-        .help(stats.error ?? "近 \(model.days ?? 7) 日：\(stats.totalText) tokens · \(statsSubtitle(stats))")
+        .help(stats.error ?? "近 \(model.days ?? 7) 日合计：\(stats.totalText) tokens · 趋势为近 7 日 · \(statsSubtitle(stats))")
     }
 
     private func statsSubtitle(_ stats: OpenCodeModel.Stats) -> String {
@@ -1094,11 +1123,6 @@ struct GlassProgressBar: View {
             animator.shown = 0
             withAnimation(.easeOut(duration: 0.8)) { animator.shown = fraction }
         }
-        .onChange(of: openID) { _ in
-            guard animate else { return }
-            animator.shown = 0
-            withAnimation(.easeOut(duration: 0.8)) { animator.shown = fraction }
-        }
         .onChange(of: fraction) { newValue in
             withAnimation(.easeOut(duration: 0.45)) { animator.shown = newValue }
         }
@@ -1157,7 +1181,7 @@ struct UsageChartCard: View {
             } else {
                 Text("悬停柱子查看当天用量")
                     .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
             }
             HStack(alignment: .bottom, spacing: 3) {
                 ForEach(Array(days.enumerated()), id: \.element.id) { index, day in
@@ -1269,6 +1293,7 @@ struct Sparkline: View {
                         endPoint: .bottom
                     ))
                     .frame(width: 6, height: animator.shown ? max(2, ratio * 20) : 1)
+                    .accessibilityLabel("\(day.date)：\(day.text) tokens")
                     .animation(.interpolatingSpring(stiffness: 240, damping: 14)
                         .delay(Double(index) * 0.03),
                         value: animator.shown)
@@ -1406,7 +1431,9 @@ enum Preview {
             NSApp.terminate(nil)
             return
         }
-        let hosting = NSHostingView(rootView: ChartPanelView(days: days) { _ in })
+        let state = ChartPanelState()
+        state.days = days
+        let hosting = NSHostingView(rootView: ChartPanelView(state: state) { _ in })
         hosting.frame = NSRect(x: 0, y: 0, width: 320, height: 190)
         let window = NSWindow(contentRect: hosting.frame,
                               styleMask: [.borderless],

@@ -141,13 +141,6 @@ for line in sys.stdin:
         self.assertTrue(model['auth_required'])
         self.assertIn('登录状态', model['error'])
 
-if __name__ == '__main__':
 
-    def test_auth_failure_is_flagged_for_the_sign_in_prompt(self):
-        base = local_data()
-        with patch.object(codex_usage, 'collect', return_value=base), \
-             patch.object(quota_api, 'query', side_effect=quota_api.AuthError('Codex 登录状态不可用，请在 Codex 中重新登录 ChatGPT 账号')):
-            result = codex_usage.collect_usage(Path('.'))
-        model = codex_usage.ui_model(result)
-        self.assertTrue(model['auth_required'])
-        self.assertIn('登录状态', model['error'])
+if __name__ == '__main__':
+    unittest.main()

@@ -129,14 +129,20 @@ class UsageTests(unittest.TestCase):
         self.assertFalse(ui_model({'refreshed_at': 1, 'latest': None, 'today': {'total_tokens': 0},
                                    'skipped_files': 0})['auth_required'])
 
-if __name__ == '__main__':
 
-    def test_auth_required_is_reported_to_the_app(self):
-        data = {'refreshed_at': 1000, 'latest': None, 'today': {'total_tokens': 0},
-                'skipped_files': 0, 'quota_error': 'Codex 登录状态不可用，请在 Codex 中重新登录 ChatGPT 账号',
-                'auth_required': True}
+    def test_account_tokens_name_the_day_they_belong_to(self):
+        data = {'refreshed_at': 1000, 'latest': None, 'today': {'total_tokens': 13584975},
+                'skipped_files': 0, 'tokens_source': '账户 API',
+                'tokens_note': '账户 token 活动口径'}
         model = ui_model(data)
-        self.assertTrue(model['auth_required'])
-        self.assertIsNone(model['headline'])
-        self.assertFalse(ui_model({'refreshed_at': 1, 'latest': None, 'today': {'total_tokens': 0},
-                                   'skipped_files': 0})['auth_required'])
+        self.assertEqual(model['tokens']['text'], '13.6M')
+        self.assertIsNone(model['tokens']['label'])
+        data['today'] = {'total_tokens': None}
+        data['last_synced'] = {'date': '10-24', 'tokens': 13584975}
+        model = ui_model(data)
+        self.assertEqual(model['tokens']['label'], '10-24')
+        self.assertEqual(model['tokens']['text'], '13.6M')
+
+
+if __name__ == '__main__':
+    unittest.main()

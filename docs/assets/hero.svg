@@ -20,7 +20,7 @@
       <text x="69" y="461">LIVE QUOTAS</text><text x="224" y="461">LOCAL FALLBACK</text><text x="410" y="461">NATIVE SETTINGS</text>
     </g>
     <path d="M68 485h570" stroke="#cbd2c6"/>
-    <text x="68" y="531" font-size="14" fill="#58685c">macOS 13+  /  SwiftBar + SwiftUI  /  Python standard library</text>
+    <text x="68" y="531" font-size="14" fill="#58685c">macOS 13+  /  SwiftUI  /  Python standard library</text>
     <text x="68" y="591" font-size="12" fill="#6a786d" letter-spacing="1.5">OPEN SOURCE · MIT LICENSE</text>
     <g filter="url(#shadow)">
       <rect x="755" y="73" width="412" height="39" rx="12" fill="#e6e9df"/>
