@@ -67,6 +67,24 @@ class SettingsTests(unittest.TestCase):
         config['low_quota_threshold'] = 10
         self.assertEqual(ui_model(data, config)['low_quota'], [])
 
+    def test_menu_bar_selection_round_trip_and_old_defaults(self):
+        self.assertEqual(settings.validate({})['menu_bar_items'], ['codex'])
+        chosen = ['codex_primary', 'codex_secondary', 'opencode_rolling', 'opencode_weekly', 'opencode_monthly']
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder) / 'settings.json'
+            settings.save({'menu_bar_items': chosen, 'show_codex': False}, config)
+            self.assertEqual(settings.read(config)['menu_bar_items'], chosen)
+            self.assertFalse(settings.read(config)['show_codex'])
+        saved = settings.validate({'menu_bar_items': chosen})
+        saved['menu_bar_items'].clear()
+        self.assertEqual(len(chosen), 5)
+        self.assertEqual(settings.DEFAULTS['menu_bar_items'], ['codex'])
+
+    def test_menu_bar_rejects_empty_unknown_duplicate_and_bad_types(self):
+        for items in ([], '', None, ['other'], ['codex', 'codex'], [1], [{}]):
+            with self.subTest(items=items), self.assertRaises(ValueError):
+                settings.validate({'menu_bar_items': items})
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -28,15 +28,16 @@ struct UIModel: Codable, Equatable {
 
     struct Tokens: Codable, Equatable {
         var text: String
-        var raw: Int
+        var raw: Int?
     }
 
     struct Day: Codable, Equatable, Identifiable {
         var date: String
         var tokens: Int
-        var inputTokens: Int
-        var outputTokens: Int
+        var inputTokens: Int?
+        var outputTokens: Int?
         var text: String
+        var available: Bool?
         var id: String { date }
     }
 
@@ -58,6 +59,8 @@ struct UIModel: Codable, Equatable {
     var lowQuota: [String]
     var tokens: Tokens?
     var history: [Day]
+    var tokensSource: String?
+    var tokensNote: String?
     var details: [String]
     var updated: String
     var error: String?
@@ -134,6 +137,7 @@ struct OpenCodeModel: Codable, Equatable {
     var workspace: String?
     var usageUrl: String?
     var goMeters: [Meter]?
+    var menuBarMeters: [Meter]?
     var budgets: [Budget]?
     var showGo: Bool?
     var limitsStatus: String?
@@ -169,7 +173,16 @@ final class UsageStore: ObservableObject {
         return path.trimmingCharacters(in: .whitespaces)
     }
 
+    var menuBarItems: [MenuBarMetric] {
+        guard let data = try? Data(contentsOf: settingsFile),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let items = object["menu_bar_items"] as? [String] else { return [.codex] }
+        let metrics = items.compactMap(MenuBarMetric.init(rawValue:))
+        return metrics.isEmpty ? [.codex] : metrics
+    }
+
     func refresh() {
+        onModel?(model)
         refreshCodex()
         refreshOpenCode()
     }
@@ -212,6 +225,7 @@ final class UsageStore: ObservableObject {
                 } else {
                     self.opencodeMessage = error
                 }
+                self.onModel?(self.model)
             }
         }
     }
@@ -269,28 +283,64 @@ final class UsageStore: ObservableObject {
 
 @MainActor
 enum StatusIcon {
-    static func make(value: String, stale: Bool, icon: UIModel.Icon?) -> NSImage {
-        let label = stale ? "Codex ·" : "Codex"
+    static func values(metrics: [MenuBarMetric], codex: UIModel?, openCode: OpenCodeModel?,
+                       now: Double = Date().timeIntervalSince1970) -> [MenuBarValue] {
+        metrics.map { metric in
+            let used: Double?
+            let stale: Bool
+            switch metric {
+            case .codex:
+                used = codex?.headline?.used
+                stale = codex?.stale ?? false
+            case .codexPrimary, .codexSecondary:
+                let key = metric == .codexPrimary ? "primary" : "secondary"
+                used = codex?.windows.first { $0.key == key && $0.available }?.used
+                stale = codex?.stale ?? false
+            case .openCodeRolling, .openCodeWeekly, .openCodeMonthly:
+                let key = metric == .openCodeRolling ? "rolling" : metric == .openCodeWeekly ? "weekly" : "monthly"
+                used = (openCode?.menuBarMeters ?? openCode?.goMeters)?.first { $0.key == key }?.used
+                stale = openCode?.updated.map { now - $0 > 900 } ?? false
+            }
+            var reading = metric.reading(used: used, stale: stale)
+            if metric == .codex, let headline = codex?.headline {
+                reading.tooltip = "Codex · \(headline.label)：剩余 \(reading.value)"
+                    + (stale ? "（记录已过时）" : "")
+            }
+            return reading
+        }
+    }
+
+    static func make(values: [MenuBarValue], icon: UIModel.Icon?) -> NSImage {
         let labelFont = NSFont.systemFont(ofSize: CGFloat(icon?.labelSize ?? 7), weight: .light)
         let weight: NSFont.Weight = icon?.weight == "semibold" ? .semibold : icon?.weight == "medium" ? .medium : .regular
         let valueFont = NSFont.systemFont(ofSize: CGFloat(icon?.valueSize ?? 12), weight: weight)
-        let base: [NSAttributedString.Key: Any] = [.foregroundColor: NSColor.black]
-        let labelAttributes = base.merging([.font: labelFont]) { $1 }
-        let valueAttributes = base.merging([.font: valueFont]) { $1 }
-        let labelWidth = (label as NSString).size(withAttributes: labelAttributes).width
-        let valueWidth = (value as NSString).size(withAttributes: valueAttributes).width
-        let contentWidth = ceil(max(labelWidth, valueWidth)) + 2
-        let width = max(contentWidth, CGFloat(icon?.width ?? 30))
-        let image = NSImage(size: NSSize(width: width, height: 22))
+        let labelAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: NSColor.black, .font: labelFont]
+        let valueAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: NSColor.black, .font: valueFont]
+        let labels = values.map { $0.label + ($0.stale ? " ·" : "") }
+        let widths = zip(labels, values).map { label, value in
+            max(CGFloat(icon?.width ?? 30), ceil(max((label as NSString).size(withAttributes: labelAttributes).width,
+                                                    (value.value as NSString).size(withAttributes: valueAttributes).width)) + 2)
+        }
+        let gap: CGFloat = 8
+        let width = widths.reduce(0, +) + CGFloat(max(0, values.count - 1)) * gap
+        let image = NSImage(size: NSSize(width: max(1, width), height: 22))
         image.lockFocus()
-        let left = max(0, (width - max(labelWidth, valueWidth)) / 2)
-        (label as NSString).draw(at: NSPoint(x: left, y: 12), withAttributes: labelAttributes)
-        (value as NSString).draw(at: NSPoint(x: left, y: CGFloat(icon?.valueOffset ?? 0)),
-                                 withAttributes: valueAttributes)
+        var x: CGFloat = 0
+        for index in values.indices {
+            let label = labels[index]
+            let value = values[index].value
+            let textWidth = max((label as NSString).size(withAttributes: labelAttributes).width,
+                                (value as NSString).size(withAttributes: valueAttributes).width)
+            let left = x + max(0, (widths[index] - textWidth) / 2)
+            (label as NSString).draw(at: NSPoint(x: left, y: 12), withAttributes: labelAttributes)
+            (value as NSString).draw(at: NSPoint(x: left, y: CGFloat(icon?.valueOffset ?? 0)), withAttributes: valueAttributes)
+            x += widths[index] + gap
+        }
         image.unlockFocus()
         image.isTemplate = true
         return image
     }
+
 }
 
 // MARK: - App delegate
@@ -314,7 +364,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.action = #selector(statusItemClicked(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
             button.imagePosition = .imageOnly
-            button.image = StatusIcon.make(value: "—", stale: false, icon: nil)
+            button.image = StatusIcon.make(values: [MenuBarMetric.codex.reading(used: nil)], icon: nil)
             button.toolTip = "Codex 额度"
         }
         popover.behavior = .transient
@@ -346,12 +396,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func apply(_ model: UIModel?) {
-        statusItem.button?.image = StatusIcon.make(
-            value: model?.iconValue ?? "—",
-            stale: model?.stale ?? false,
-            icon: model?.icon
-        )
-        statusItem.button?.toolTip = model?.tooltip ?? "Codex 额度"
+        let values = StatusIcon.values(metrics: store.menuBarItems, codex: model, openCode: store.opencode)
+        statusItem.button?.image = StatusIcon.make(values: values, icon: model?.icon)
+        statusItem.button?.toolTip = values.map(\.tooltip).joined(separator: "\n")
         schedule(minutes: model?.refreshMinutes ?? 5)
     }
 
@@ -698,9 +745,10 @@ struct PopoverView: View {
 
     private func summary(_ model: UIModel) -> some View {
         UsageSummaryView(tokensText: model.tokens?.text, updated: model.updated,
-                         stale: model.stale, history: model.history) { hovering in
+                         stale: model.stale, history: model.history, source: model.tokensSource) { hovering in
             onHoverChange?(hovering, model.history)
         }
+        .help(model.tokensNote ?? "本机日志估算，按本机时区统计。")
     }
 
     private var footer: some View {
@@ -730,7 +778,7 @@ struct UsageSummaryView: View {
         HStack(alignment: .bottom, spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
                 if let tokensText {
-                    Text("今日 \(tokensText) tokens")
+                    Text(tokensText == "待同步" ? "今日 tokens 待同步" : "今日 \(tokensText) tokens")
                         .font(.system(size: 11.5, weight: .medium))
                 }
                 HStack(spacing: 4) {
@@ -1092,20 +1140,22 @@ struct UsageChartCard: View {
                         .font(.system(size: 9.5, weight: .medium))
                         .foregroundStyle(.secondary)
                 } else {
-                    Text("共 \(compactTokens(total))")
+                    Text(days.contains(where: { $0.available == false })
+                         ? "已同步 \(days.filter { $0.available != false }.count) 日 · \(compactTokens(total))"
+                         : "共 \(compactTokens(total))")
                         .font(.system(size: 9.5))
                         .foregroundStyle(.secondary)
                 }
             }
             if let index = hover.index, days.indices.contains(index) {
                 let day = days[index]
-                Text("输入 \(compactTokens(day.inputTokens)) · 输出 \(compactTokens(day.outputTokens)) · 总计 \(day.text)")
+                Text(dayDetail(day))
                     .font(.system(size: 9))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .minimumScaleFactor(0.8)
             } else {
-                Text("悬停柱子查看当天输入 / 输出")
+                Text("悬停柱子查看当天用量")
                     .font(.system(size: 9))
                     .foregroundStyle(.tertiary)
             }
@@ -1184,6 +1234,15 @@ struct UsageChartCard: View {
             .strokeBorder(Color.primary.opacity(0.14), lineWidth: 0.5))
         .shadow(color: .black.opacity(0.22), radius: 12, y: 5)
     }
+
+    private func dayDetail(_ day: UIModel.Day) -> String {
+        if day.available == false { return "当天用量待同步" }
+        if let input = day.inputTokens, let output = day.outputTokens {
+            return "输入 \(compactTokens(input)) · 输出 \(compactTokens(output)) · 总计 \(day.text)"
+        }
+        return "总计 \(day.text) tokens · 接口未提供输入 / 输出拆分"
+    }
+
 }
 
 func compactTokens(_ value: Int) -> String {
@@ -1370,6 +1429,18 @@ enum Preview {
 
     static func capture(store: UsageStore) {
         store.opencode = sampleOpenCode
+        let values = StatusIcon.values(metrics: MenuBarMetric.allQuotas, codex: store.model, openCode: sampleOpenCode)
+        let icon = StatusIcon.make(values: values, icon: store.model?.icon)
+        let canvas = NSImage(size: NSSize(width: icon.size.width + 32, height: 54))
+        canvas.lockFocus()
+        NSColor.white.setFill()
+        NSRect(origin: .zero, size: canvas.size).fill()
+        icon.draw(at: NSPoint(x: 16, y: 16), from: .zero, operation: .sourceOver, fraction: 1)
+        canvas.unlockFocus()
+        if let data = canvas.tiffRepresentation, let rep = NSBitmapImageRep(data: data) {
+            try? rep.representation(using: .png, properties: [:])?
+                .write(to: URL(fileURLWithPath: "/tmp/codex-menu-bar.png"))
+        }
         let hosting = NSHostingView(rootView: PopoverView(store: store, openID: UUID(), animateBar: false))
         hosting.frame = NSRect(x: 0, y: 0, width: 330, height: 540)
         let window = NSWindow(contentRect: hosting.frame,

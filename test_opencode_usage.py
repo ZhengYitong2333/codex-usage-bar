@@ -55,6 +55,13 @@ class OpenCodeUsageTests(unittest.TestCase):
         self.assertEqual(model['budgets'], [])
         self.assertEqual(model['stats']['total'], 10)
 
+    def test_menu_bar_quotas_remain_available_when_card_meters_are_hidden(self):
+        limits = {'go': {key: {'percent': index * 10} for index, key in enumerate(('rolling', 'weekly', 'monthly'))}}
+        model = opencode_usage.normalize({}, limits, 7, 'used', now=1000, show_go=False, show_weekly=False)
+        self.assertEqual(model['go_meters'], [])
+        self.assertEqual([meter['key'] for meter in model['menu_bar_meters']], ['rolling', 'weekly', 'monthly'])
+        self.assertEqual(model['menu_bar_meters'][1]['remaining'], 90)
+
     def test_empty_reason(self):
         model = opencode_usage.empty('未找到 OpenCode CLI')
         self.assertFalse(model['available'])

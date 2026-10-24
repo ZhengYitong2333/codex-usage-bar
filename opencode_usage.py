@@ -396,6 +396,7 @@ def normalize(stats, limits, days, display, now,
         'usage_url': None,
         'go': None,
         'go_meters': [],
+        'menu_bar_meters': [],
         'budgets': [],
         'show_go': show_go,
         'limits_status': None,
@@ -421,6 +422,10 @@ def normalize(stats, limits, days, display, now,
             result['usage_url'] = workspace.get('usageURL') if isinstance(workspace.get('usageURL'), str) else None
         go = limits.get('go')
         if isinstance(go, dict):
+            for key, label in (('rolling', '滚动额度'), ('weekly', '每周额度'), ('monthly', '每月额度')):
+                entry = meter(key, label, go.get(key), now, display)
+                if entry is not None:
+                    result['menu_bar_meters'].append(entry)
             enabled = {'rolling': show_rolling, 'weekly': show_weekly, 'monthly': show_monthly}
             if not show_go:
                 enabled = {key: False for key in enabled}

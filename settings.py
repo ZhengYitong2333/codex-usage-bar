@@ -15,8 +15,10 @@ DEFAULTS = dict(refresh_minutes=5, window='primary', display='remaining',
                 opencode_show_go=True, opencode_show_rolling=True,
                 opencode_show_weekly=True, opencode_show_monthly=True,
                 opencode_show_stats=True, opencode_show_cost=True,
-                opencode_cli='')
+                opencode_cli='', menu_bar_items=['codex'])
 INTERVALS = (1, 2, 5, 10, 15, 30)
+MENU_BAR_ITEMS = ('codex', 'codex_primary', 'codex_secondary',
+                  'opencode_rolling', 'opencode_weekly', 'opencode_monthly')
 
 
 def validate(raw):
@@ -42,6 +44,12 @@ def validate(raw):
             raise ValueError(f'无效设置：{key}')
     if not isinstance(result['opencode_cli'], str):
         raise ValueError('无效设置：opencode_cli')
+    items = result['menu_bar_items']
+    if (not isinstance(items, list) or not items
+            or any(not isinstance(item, str) or item not in MENU_BAR_ITEMS for item in items)
+            or len(items) != len(set(items))):
+        raise ValueError('无效设置：menu_bar_items')
+    result['menu_bar_items'] = list(items)
     for key, low, high in [('label_size', 6, 10), ('value_size', 10, 15), ('width', 30, 44), ('value_offset', -2, 2)]:
         value = result[key]
         if type(value) is not int or not low <= value <= high:

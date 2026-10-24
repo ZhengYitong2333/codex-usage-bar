@@ -25,6 +25,11 @@ def local_data(latest=True):
 
 
 class QuotaTests(unittest.TestCase):
+    def setUp(self):
+        usage = patch.object(quota_api, 'query_usage', side_effect=quota_api.QuotaQueryError('Fixture'))
+        self.usage_query = usage.start()
+        self.addCleanup(usage.stop)
+
     def test_selects_codex_bucket_and_discards_account_metadata(self):
         snapshot = quota_api.normalize(response())
         self.assertEqual(snapshot['primary']['used_percent'], 18)
@@ -83,6 +88,7 @@ class QuotaTests(unittest.TestCase):
         with patch.object(codex_usage, 'collect', return_value=local_data()), patch.object(quota_api, 'query') as query:
             result = codex_usage.collect_usage(Path('.'), local_only=True)
         query.assert_not_called()
+        self.usage_query.assert_not_called()
         self.assertEqual(result['quota_source'], 'log')
 
     def test_rpc_handshake_notifications_and_cleanup(self):

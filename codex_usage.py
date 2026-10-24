@@ -95,6 +95,7 @@ def collect_usage(home, local_only=False):
     data = collect(home, now)
     data['scanned_at'] = now
     data['quota_source'] = 'log'
+    data['tokens_source'] = '本机统计'
     data['query_enabled'] = not local_only
     if not local_only:
         try:
@@ -105,9 +106,30 @@ def collect_usage(home, local_only=False):
             data['auth_required'] = True
         except quota_api.QuotaQueryError as error:
             data['quota_error'] = str(error)
+        if not data.get('auth_required'):
+            try:
+                daily = quota_api.query_usage(home)
+                data.update(account_tokens(daily, now))
+                data['tokens_source'] = '账户 API'
+                data['tokens_note'] = '账户 token 活动口径，按接口日期展示；未返回的日期显示待同步，接口不提供输入/输出拆分。'
+            except (quota_api.QuotaQueryError, ValueError):
+                data['tokens_note'] = '账户 token 接口暂不可用，已回退到本机日志估算。'
         data['queried_at'] = dt.datetime.now().timestamp()
         data['refreshed_at'] = data['queried_at']
     return data
+
+
+def account_tokens(daily, now):
+    # Keep API calendar dates; never mix account totals with local estimates.
+    daily = {dt.date.fromisoformat(day): tokens for day, tokens in daily.items()}
+    today = dt.datetime.fromtimestamp(now).date()
+    days = [today - dt.timedelta(days=offset) for offset in range(6, -1, -1)]
+    if not any(day in daily for day in days):
+        raise ValueError('No recent account usage')
+    history = [{'date': day.strftime('%m-%d'), 'tokens': daily.get(day, 0),
+                'available': day in daily, 'input_tokens': None, 'output_tokens': None,
+                'text': compact_tokens(daily[day]) if day in daily else '—'} for day in days]
+    return {'today': {'total_tokens': daily.get(today)}, 'history': history}
 
 
 def local_time(value):
@@ -215,6 +237,8 @@ def ui_model(data, settings=None):
         'low_quota': [],
         'tokens': None,
         'history': [],
+        'tokens_source': data.get('tokens_source', '本机统计'),
+        'tokens_note': data.get('tokens_note'),
         'details': [],
         'error': data.get('quota_error'),
         'auth_required': bool(data.get('auth_required')),
@@ -229,7 +253,7 @@ def ui_model(data, settings=None):
                  ('label_size', 'value_size', 'weight', 'width', 'value_offset')},
     }
     if settings['show_tokens']:
-        model['tokens'] = {'text': compact_tokens(tokens), 'raw': tokens}
+        model['tokens'] = {'text': compact_tokens(tokens) if tokens is not None else '待同步', 'raw': tokens}
         model['history'] = data.get('history', [])
     if latest:
         limits = quota_windows(latest['limits'])
@@ -330,7 +354,7 @@ def summary(data, settings=None):
             lines.append(f"  {window['label']}  {window['status']}"
                          + (f"（{window['reason']}）" if window['reason'] else ''))
     if model['tokens']:
-        lines.append(f"  今日 tokens {model['tokens']['text']}（本机估算）")
+        lines.append(f"  今日 tokens {model['tokens']['text']}（{model['tokens_source']}）")
     lines.append(f"  来源 {model['source']} · 更新于 {model['updated']}")
     if model['error']:
         lines.append(f"  查询失败：{model['error']}")

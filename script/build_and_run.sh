@@ -14,7 +14,7 @@ build_app() {
   local source="$1" plist="$2" bundle="$3" executable="$4"
   mkdir -p "$bundle/Contents/MacOS"
   xcrun swiftc -O -parse-as-library -target "$target" -module-cache-path "$build_dir/module-cache" \
-    "$project_root/$source" -o "$bundle/Contents/MacOS/$executable"
+    "$project_root/MenuBarMetric.swift" "$project_root/$source" -o "$bundle/Contents/MacOS/$executable"
   cp "$project_root/$plist" "$bundle/Contents/Info.plist"
   /usr/bin/codesign --force --sign - "$bundle" >/dev/null 2>&1
 }

@@ -26,9 +26,11 @@ struct Preferences: Codable, Equatable {
     var opencode_show_stats = true
     var opencode_show_cost = true
     var opencode_cli = ""
+    var menu_bar_items: [MenuBarMetric] = [.codex]
 }
 
 @MainActor final class SettingsStore: ObservableObject {
+    @Published var selectedTab = CommandLine.arguments.contains("--preview") || CommandLine.arguments.contains("--appearance") ? "appearance" : "codex"
     @Published var draft = Preferences()
     @Published var saved = Preferences()
     @Published var busy = false
@@ -51,6 +53,11 @@ struct Preferences: Codable, Equatable {
                 message = "无法读取设置，当前显示默认值。保存后可恢复。"
                 failed = true
             }
+        }
+        if CommandLine.arguments.contains("--preview") {
+            draft.menu_bar_items = MenuBarMetric.allQuotas
+            saved = draft
+            return
         }
         Task { await refreshAvailability() }
     }
@@ -138,29 +145,36 @@ struct SettingsView: View {
     }
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 16) {
-                VStack(alignment: .leading, spacing: 0) {
-                    Text("Codex").font(.system(size: CGFloat(store.draft.label_size), weight: .light))
-                    Text(store.draft.display == "remaining" ? "82%" : "18%")
-                        .font(.system(size: CGFloat(store.draft.value_size), weight: valueWeight))
-                        .offset(y: -CGFloat(store.draft.value_offset))
+            VStack(alignment: .leading, spacing: 12) {
+                Text("用量设置").font(.title2.weight(.semibold))
+                Text("Codex 与 OpenCode 的菜单栏配置").font(.caption).foregroundStyle(.secondary)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 10) {
+                        ForEach(store.draft.menu_bar_items) { metric in
+                            let reading = metric.reading(used: 18)
+                            VStack(alignment: .leading, spacing: 0) {
+                                Text(reading.label)
+                                    .font(.system(size: CGFloat(store.draft.label_size), weight: .light))
+                                Text(reading.value)
+                                    .font(.system(size: CGFloat(store.draft.value_size), weight: valueWeight))
+                                    .offset(y: -CGFloat(store.draft.value_offset))
+                            }
+                            .frame(minWidth: CGFloat(store.draft.width), minHeight: 22)
+                        }
+                    }
+                    .foregroundStyle(.white)
                 }
-                .frame(width: CGFloat(store.draft.width), height: 22)
-                .foregroundStyle(.white)
-                .padding(14)
-                .background(Color.black, in: RoundedRectangle(cornerRadius: 12))
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("用量设置").font(.title2.weight(.semibold))
-                    Text("Codex 与 OpenCode 的菜单栏配置").font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer()
+                .frame(height: 22)
+                .padding(12)
+                .background(Color.black, in: RoundedRectangle(cornerRadius: 10))
+                .help("菜单栏示例；数字为示意数据")
             }.padding(24)
 
-            TabView {
-                codexSettings.tabItem { Label("Codex", systemImage: "terminal") }
-                openCodeSettings.tabItem { Label("OpenCode", systemImage: "curlybraces") }
-                generalSettings.tabItem { Label("通用", systemImage: "slider.horizontal.3") }
-                appearanceSettings.tabItem { Label("外观", systemImage: "textformat.size") }
+            TabView(selection: $store.selectedTab) {
+                codexSettings.tabItem { Label("Codex", systemImage: "terminal") }.tag("codex")
+                openCodeSettings.tabItem { Label("OpenCode", systemImage: "curlybraces") }.tag("openCode")
+                generalSettings.tabItem { Label("通用", systemImage: "slider.horizontal.3") }.tag("general")
+                appearanceSettings.tabItem { Label("外观", systemImage: "textformat.size") }.tag("appearance")
             }
             .padding(.horizontal, 16)
             .disabled(store.busy)
@@ -206,11 +220,11 @@ struct SettingsView: View {
         Form {
             Section {
                 Toggle("显示 Codex 卡片", isOn: codexVisible)
-                Text("菜单栏和弹层顶部的 Codex 卡片；至少保留一张卡片。")
+                Text("控制弹层中的 Codex 卡片；菜单栏显示项在“外观”中单独设置。")
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("Codex 卡片") }
             Section {
-                Picker("菜单栏主数字", selection: Binding(
+                Picker("当前主额度", selection: Binding(
                     get: { store.draft.window },
                     set: { selected in
                         if store.canSelect(selected) { store.draft.window = selected }
@@ -289,6 +303,16 @@ struct SettingsView: View {
         }.formStyle(.grouped)
     }
 
+    private func menuBarSelection(_ metric: MenuBarMetric) -> Binding<Bool> {
+        Binding(
+            get: { store.draft.menu_bar_items.contains(metric) },
+            set: { enabled in
+                store.draft.menu_bar_items = MenuBarMetric.selection(store.draft.menu_bar_items,
+                                                                     metric: metric, enabled: enabled)
+            }
+        )
+    }
+
     private var generalSettings: some View {
         Form {
             Section {
@@ -310,6 +334,18 @@ struct SettingsView: View {
 
     private var appearanceSettings: some View {
         Form {
+            Section {
+                HStack {
+                    Button("全部显示") { store.draft.menu_bar_items = MenuBarMetric.allQuotas }
+                    Button("仅 Codex 主额度") { store.draft.menu_bar_items = [.codex] }
+                }
+                ForEach(MenuBarMetric.allCases) { metric in
+                    Toggle(metric.label, isOn: menuBarSelection(metric))
+                        .disabled(store.draft.menu_bar_items == [metric])
+                }
+                Text("可同时勾选 Codex 和 OpenCode，至少保留一项；全部显示时并排展示 5 项剩余额度。暂无数据显示 —，选择与卡片开关独立。")
+                    .font(.caption).foregroundStyle(.secondary)
+            } header: { Text("菜单栏显示内容") }
                 Section {
                     Stepper("标签字号：\(store.draft.label_size) pt", value: $store.draft.label_size, in: 6...10)
                     Stepper("数字字号：\(store.draft.value_size) pt", value: $store.draft.value_size, in: 10...15)
@@ -328,7 +364,28 @@ struct SettingsView: View {
 @main struct CodexUsageSettingsApp: App {
     var body: some Scene {
         Window("Codex 用量设置", id: "settings") {
-            SettingsView().onAppear { NSApp.activate(ignoringOtherApps: true) }
+            SettingsView().onAppear {
+                NSApp.activate(ignoringOtherApps: true)
+                if CommandLine.arguments.contains("--preview") {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                        if let view = NSApp.keyWindow?.contentView,
+                           let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+                            view.cacheDisplay(in: view.bounds, to: rep)
+                            let image = NSImage(size: view.bounds.size)
+                            image.lockFocus()
+                            NSColor.windowBackgroundColor.setFill()
+                            NSRect(origin: .zero, size: image.size).fill()
+                            rep.draw(in: NSRect(origin: .zero, size: image.size))
+                            image.unlockFocus()
+                            if let data = image.tiffRepresentation, let bitmap = NSBitmapImageRep(data: data) {
+                                try? bitmap.representation(using: .png, properties: [:])?
+                                    .write(to: URL(fileURLWithPath: "/tmp/codex-settings.png"))
+                            }
+                        }
+                        NSApp.terminate(nil)
+                    }
+                }
+            }
         }.windowResizability(.contentSize)
     }
 }

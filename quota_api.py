@@ -71,6 +71,32 @@ def normalize(result):
 
 def query(home, timeout=12):
     """Query quotas without creating a conversation or reading auth secrets."""
+    result = account_request(home, 'account/rateLimits/read', timeout)
+    return {'timestamp': time.time(), 'limits': normalize(result)}
+
+
+def query_usage(home, timeout=12):
+    """Read daily account totals; discard thread and account metadata."""
+    result = account_request(home, 'account/usage/read', timeout)
+    buckets = result.get('dailyUsageBuckets') if isinstance(result, dict) else None
+    if not isinstance(buckets, list) or not buckets:
+        raise QuotaQueryError('账户接口暂未提供每日 token 用量')
+    daily = {}
+    for bucket in buckets:
+        if not isinstance(bucket, dict):
+            raise QuotaQueryError('账户 token 用量格式不正确')
+        day, tokens = bucket.get('startDate'), bucket.get('tokens')
+        if (not isinstance(day, str) or isinstance(tokens, bool)
+                or not isinstance(tokens, int) or tokens < 0 or day in daily):
+            raise QuotaQueryError('账户 token 用量格式不正确')
+        daily[day] = tokens
+    return daily
+
+
+def account_request(home, method, timeout=12):
+    """Shared transport for the two read-only account queries."""
+    if method not in ('account/rateLimits/read', 'account/usage/read'):
+        raise QuotaQueryError('不支持的账户查询')
     env = dict(os.environ)
     env['CODEX_HOME'] = str(Path(home).expanduser().resolve())
     process = None
@@ -122,11 +148,11 @@ def query(home, timeout=12):
                         raise api_error(message['error'])
                     initialized = True
                     send({'method': 'initialized', 'params': {}})
-                    send({'id': 2, 'method': 'account/rateLimits/read'})
+                    send({'id': 2, 'method': method})
                 elif request_id == 2 and initialized:
                     if 'error' in message:
                         raise api_error(message['error'])
-                    return {'timestamp': time.time(), 'limits': normalize(message.get('result'))}
+                    return message.get('result')
     except QuotaQueryError:
         raise
     except (OSError, ValueError, TypeError, subprocess.SubprocessError):
