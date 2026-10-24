@@ -262,6 +262,45 @@ def read_stats(binary, days=7, timeout=45):
     return stats
 
 
+def token_counts(stats):
+    tokens = stats.get('tokens')
+    if not isinstance(tokens, dict):
+        raise OpenCodeError('OpenCode 未提供 token 统计')
+    cache = tokens.get('cache') or {}
+    if not isinstance(cache, dict):
+        raise OpenCodeError('OpenCode token 统计格式不正确')
+    values = [tokens.get('input', 0), tokens.get('output', 0),
+              tokens.get('reasoning', 0), cache.get('read', 0), cache.get('write', 0)]
+    if not all(number(value) and value >= 0 for value in values):
+        raise OpenCodeError('OpenCode token 统计格式不正确')
+    return {'input_tokens': int(values[0]), 'output_tokens': int(values[1]),
+            'tokens': int(sum(values))}
+
+
+def read_history(binary, now, timeout=45):
+    """Derive calendar-day tokens from CLI cumulative calendar-day windows."""
+    today = dt.datetime.fromtimestamp(now).date()
+    deadline = time.monotonic() + timeout
+    previous = dict.fromkeys(('input_tokens', 'output_tokens', 'tokens'), 0)
+    history = []
+    for days in range(1, 8):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise OpenCodeError('OpenCode 每日统计查询超时')
+        stats = read_stats(binary, days=days, timeout=remaining)
+        day = today - dt.timedelta(days=days - 1)
+        window = stats.get('range')
+        start = timestamp(window.get('from')) if isinstance(window, dict) else None
+        if start is None or dt.datetime.fromtimestamp(start).date() != day:
+            raise OpenCodeError('OpenCode 未提供按自然日统计的用量')
+        counts = token_counts(stats)
+        entry = {key: max(0, counts[key] - previous[key]) for key in previous}
+        entry.update(date=day.strftime('%m-%d'), text=compact(entry['tokens']))
+        history.append(entry)
+        previous = counts
+    return list(reversed(history))
+
+
 def meter(key, label, raw, now, display):
     if not isinstance(raw, dict) or not number(raw.get('percent')):
         return None
@@ -413,6 +452,14 @@ def query(days=7, display='remaining', timeout=45, cli=None,
                        show_cost=show_cost)
     result['limits_status'] = limits_status
     result['error'] = error
+    if result['stats'] is not None:
+        try:
+            result['stats']['history'] = read_history(binary, now, timeout=timeout)
+            result['stats']['today_text'] = result['stats']['history'][-1]['text']
+        except OpenCodeError as exc:
+            result['stats']['history'] = []
+            result['stats']['today_text'] = None
+            result['stats']['error'] = str(exc)
     result['queried_at'] = now
     return result
 

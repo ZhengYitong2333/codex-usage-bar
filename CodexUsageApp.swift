@@ -61,6 +61,7 @@ struct UIModel: Codable, Equatable {
     var details: [String]
     var updated: String
     var error: String?
+    var authRequired: Bool?
     var source: String
     var refreshMinutes: Int
     var queryEnabled: Bool
@@ -121,6 +122,9 @@ struct OpenCodeModel: Codable, Equatable {
         var activeDays: Int
         var streak: Int
         var activity: [Activity]
+        var todayText: String?
+        var history: [UIModel.Day]?
+        var error: String?
     }
 
     var available: Bool
@@ -375,7 +379,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let controller = NSHostingController(rootView: PopoverView(
             store: store,
             openID: UUID(),
-            onHoverChange: { [weak self] hovering in self?.chartHoverChanged(hovering) }
+            onHoverChange: { [weak self] hovering, days in self?.chartHoverChanged(hovering, days: days) }
         ))
         if #available(macOS 13.0, *) {
             controller.sizingOptions = [.preferredContentSize]
@@ -388,10 +392,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.refresh()
     }
 
-    private func chartHoverChanged(_ hovering: Bool) {
-        if hovering {
+    private func chartHoverChanged(_ hovering: Bool, days: [UIModel.Day]) {
+        if hovering && days.count > 1 {
             cancelHide()
-            showChartPanel()
+            showChartPanel(days: days)
         } else {
             scheduleHide()
         }
@@ -417,8 +421,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hideWorkItem = nil
     }
 
-    private func showChartPanel() {
-        guard let days = store.model?.history, days.count > 1,
+    private func showChartPanel(days: [UIModel.Day]) {
+        guard days.count > 1,
               let popoverWindow = popover.contentViewController?.view.window else { return }
         let size = NSSize(width: 320, height: 190)
         let visible = (popoverWindow.screen ?? NSScreen.main)?.visibleFrame
@@ -448,6 +452,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             panel.acceptsMouseMovedEvents = true
             chartPanel = panel
         }
+        let hosting = NSHostingView(rootView: ChartPanelView(days: days) { [weak self] hovering in
+            self?.panelHoverChanged(hovering)
+        })
+        hosting.frame = NSRect(origin: .zero, size: size)
+        panel.contentView = hosting
         if panel.isVisible {
             panelGeneration += 1
             panel.alphaValue = 1
@@ -455,11 +464,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         panelGeneration += 1
-        let hosting = NSHostingView(rootView: ChartPanelView(days: days) { [weak self] hovering in
-            self?.panelHoverChanged(hovering)
-        })
-        hosting.frame = NSRect(origin: .zero, size: size)
-        panel.contentView = hosting
         let startFrame = NSRect(origin: NSPoint(x: finalFrame.origin.x + 24, y: finalFrame.origin.y),
                                 size: size)
         panel.setFrame(startFrame, display: false)
@@ -553,7 +557,7 @@ struct PopoverView: View {
     @ObservedObject var store: UsageStore
     let openID: UUID
     var animateBar = true
-    var onHoverChange: ((Bool) -> Void)?
+    var onHoverChange: ((Bool, [UIModel.Day]) -> Void)?
 
     var body: some View {
         let showCodex = store.model?.showCodex ?? true
@@ -581,31 +585,15 @@ struct PopoverView: View {
                             .font(.system(size: 10.5))
                             .foregroundStyle(.orange)
                         }
-                        if let error = model.error ?? store.message {
-                            if error.contains("登录状态") {
-                                HStack(spacing: 8) {
-                                    Text(error)
-                                        .font(.system(size: 10.5))
-                                        .foregroundStyle(.orange)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                    Spacer(minLength: 4)
-                                    Button("登录") {
-                                        TerminalCommand.run("codex login; echo '登录完成，可关闭此窗口'")
-                                    }
-                                    .buttonStyle(.plain)
-                                    .font(.system(size: 10.5, weight: .medium))
-                                    .padding(.horizontal, 7)
-                                    .padding(.vertical, 2)
-                                    .background(Capsule().fill(Color.primary.opacity(0.10)))
-                                    .foregroundStyle(.primary)
-                                    .help("在终端中执行 codex login")
-                                }
-                            } else {
-                                Text(error)
-                                    .font(.system(size: 10.5))
-                                    .foregroundStyle(.orange)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
+                        if model.authRequired == true {
+                            LoginRow(message: "未登录 Codex",
+                                     command: "codex login; echo '登录完成，可关闭此窗口'",
+                                     help: "在终端中执行 codex login")
+                        } else if let error = model.error ?? store.message {
+                            Text(error)
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
                     hairline
@@ -621,7 +609,8 @@ struct PopoverView: View {
             }
             if showOpenCode {
                 if showCodex { hairline }
-                OpenCodeCard(store: store, openID: openID, animateBar: animateBar)
+                OpenCodeCard(store: store, openID: openID, animateBar: animateBar,
+                             onHoverChange: onHoverChange)
             }
             hairline
             footer
@@ -708,33 +697,10 @@ struct PopoverView: View {
     }
 
     private func summary(_ model: UIModel) -> some View {
-        HStack(alignment: .bottom, spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                if let tokens = model.tokens {
-                    Text("今日 \(tokens.text) tokens")
-                        .font(.system(size: 11.5, weight: .medium))
-                }
-                HStack(spacing: 4) {
-                    Image(systemName: "clock").font(.system(size: 8.5))
-                    Text("更新于 \(model.updated)").font(.system(size: 10))
-                    if model.stale {
-                        Text("已过时")
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(.orange)
-                    }
-                }
-                .foregroundStyle(.secondary)
-            }
-            Spacer(minLength: 6)
-            if model.history.count > 1 {
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text("近 7 日").font(.system(size: 9)).foregroundStyle(.tertiary)
-                    Sparkline(days: model.history)
-                }
-            }
+        UsageSummaryView(tokensText: model.tokens?.text, updated: model.updated,
+                         stale: model.stale, history: model.history) { hovering in
+            onHoverChange?(hovering, model.history)
         }
-        .contentShape(Rectangle())
-        .onHover { onHoverChange?($0) }
     }
 
     private var footer: some View {
@@ -749,6 +715,45 @@ struct PopoverView: View {
             }
             FooterButton(icon: "power", title: "退出") { NSApp.terminate(nil) }
         }
+    }
+}
+
+struct UsageSummaryView: View {
+    let tokensText: String?
+    let updated: String
+    var stale = false
+    let history: [UIModel.Day]
+    var source: String? = nil
+    var onHover: ((Bool) -> Void)?
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                if let tokensText {
+                    Text("今日 \(tokensText) tokens")
+                        .font(.system(size: 11.5, weight: .medium))
+                }
+                HStack(spacing: 4) {
+                    Image(systemName: "clock").font(.system(size: 8.5))
+                    Text("更新于 \(updated)" + (source.map { " · " + $0 } ?? "")).font(.system(size: 10))
+                    if stale {
+                        Text("已过时")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(.orange)
+                    }
+                }
+                .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 6)
+            if history.count > 1 {
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("近 7 日").font(.system(size: 9)).foregroundStyle(.tertiary)
+                    Sparkline(days: history)
+                }
+            }
+        }
+        .contentShape(Rectangle())
+        .onHover { onHover?($0) }
     }
 }
 
@@ -789,12 +794,36 @@ enum TerminalCommand {
     }
 }
 
+struct LoginRow: View {
+    let message: String
+    let command: String
+    let help: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(message)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 4)
+            Button("登录") { TerminalCommand.run(command) }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .medium))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Capsule().fill(Color.primary.opacity(0.10)))
+                .foregroundStyle(.primary)
+                .help(help)
+        }
+    }
+}
+
 // MARK: - OpenCode card
 
 struct OpenCodeCard: View {
     @ObservedObject var store: UsageStore
     let openID: UUID
     var animateBar = true
+    var onHoverChange: ((Bool, [UIModel.Day]) -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -925,20 +954,9 @@ struct OpenCodeCard: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
         } else {
-            HStack(spacing: 8) {
-                Text("未登录 OpenCode Go / Console")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 4)
-                Button("登录") { TerminalCommand.run(loginCommand) }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 11, weight: .medium))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(Capsule().fill(Color.primary.opacity(0.10)))
-                    .foregroundStyle(.primary)
-                    .help("在终端中执行 opencode auth login")
-            }
+            LoginRow(message: "未登录 OpenCode Go / Console",
+                     command: loginCommand,
+                     help: "在终端中执行 opencode auth login")
         }
     }
 
@@ -950,24 +968,15 @@ struct OpenCodeCard: View {
     }
 
     private func statsView(_ stats: OpenCodeModel.Stats, model: OpenCodeModel) -> some View {
-        HStack(alignment: .bottom, spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("近 \(model.days ?? 7) 日 \(stats.totalText) tokens")
-                    .font(.system(size: 11.5, weight: .medium))
-                Text(statsSubtitle(stats))
-                    .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-            }
-            Spacer(minLength: 6)
-            VStack(alignment: .trailing, spacing: 2) {
-                Text("近 7 日活跃")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
-                ActivitySparkline(activity: stats.activity)
-            }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        let updated = model.updated.map { formatter.string(from: Date(timeIntervalSince1970: $0)) } ?? "—"
+        let history = stats.history ?? []
+        return UsageSummaryView(tokensText: stats.todayText ?? "—", updated: updated,
+                                history: history, source: "本机统计") { hovering in
+            onHoverChange?(hovering, history)
         }
+        .help(stats.error ?? "近 \(model.days ?? 7) 日：\(stats.totalText) tokens · \(statsSubtitle(stats))")
     }
 
     private func statsSubtitle(_ stats: OpenCodeModel.Stats) -> String {
@@ -983,39 +992,6 @@ struct OpenCodeCard: View {
 
     private func budgetFraction(_ budget: OpenCodeModel.Budget, display: String?) -> Double {
         budget.limit > 0 ? max(0, min(1, (display == "remaining" ? budget.remaining : budget.spent) / budget.limit)) : 0
-    }
-}
-
-struct ActivitySparkline: View {
-    let activity: [OpenCodeModel.Activity]
-    @StateObject private var animator = ChartAnimator()
-
-    var body: some View {
-        let peak = max(activity.map(\.steps).max() ?? 0, 1)
-        HStack(alignment: .bottom, spacing: 2.5) {
-            ForEach(Array(activity.enumerated()), id: \.element.id) { index, day in
-                let ratio = CGFloat(day.steps) / CGFloat(peak)
-                RoundedRectangle(cornerRadius: 1.5)
-                    .fill(LinearGradient(
-                        colors: [Color.primary.opacity(day.date == activity.last?.date ? 0.72 : 0.45),
-                                 Color.primary.opacity(0.16)],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    ))
-                    .frame(width: 6, height: animator.shown ? max(2, ratio * 20) : 1)
-                    .animation(.interpolatingSpring(stiffness: 240, damping: 14)
-                        .delay(Double(index) * 0.03),
-                        value: animator.shown)
-                    .accessibilityLabel("\(day.date)：\(day.steps) steps")
-            }
-        }
-        .frame(height: 20, alignment: .bottom)
-        .onAppear {
-            animator.shown = false
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                animator.shown = true
-            }
-        }
     }
 }
 
@@ -1331,7 +1307,14 @@ enum Preview {
                 .init(date: "10-23", steps: 8, level: 1),
                 .init(date: "10-24", steps: 4, level: 0),
                 .init(date: "10-25", steps: 16, level: 1),
-            ]
+            ],
+            todayText: "120k",
+            history: (0..<7).map { index in
+                let tokens = [80_000, 240_000, 100_000, 180_000, 40_000, 20_000, 120_000][index]
+                return UIModel.Day(date: "10-\(19 + index)", tokens: tokens,
+                                   inputTokens: tokens * 4 / 5, outputTokens: tokens / 5,
+                                   text: compactTokens(tokens))
+            }
         ),
         updated: Date().timeIntervalSince1970,
         error: nil

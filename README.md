@@ -83,6 +83,8 @@ codex app-server · stdio
 
 **OpenCode** 通过 `opencode stats --json` 读取本地统计。Go/Console 额度优先走 OpenCode 本地服务的 `/api/experimental/usage/limits`；较旧的 OpenCode 没有这个接口，此时直接调用 OpenCode Console 的 `/zen/go/v1/usage` 与 `/api/policies/current-budgets`。
 
+两张卡片共用统计布局：今日 tokens、更新时间、近 7 日 token 趋势及悬停明细。OpenCode 标注“本机统计”，每日用量从 CLI 的自然日累计窗口计算；费用和会话信息保留在说明中。设置里的详情统计范围不改变近 7 日趋势。
+
 这两种方式都复用 OpenCode 自己的登录状态：本地服务把地址和一次性服务密码写在 `~/.local/state/opencode/service.json`，Console 请求则使用 OpenCode 存储在 `~/.local/share/opencode/opencode.db` 里的账号凭据（Go 读取 `opencode-go`，Console 读取 `opencode`）。Go Key 仅用于 Go 额度查询，不用于 Console 预算接口；查询失败会显示错误，不再误报未登录。凭据只在内存中用于填充请求头，不复制、不落盘、不打印，也不会写进本工具的配置。
 
 **窗口**按实际时长识别：300 分钟对应 5 小时，10080 分钟对应每周。接口中的 `primary` 与 `secondary` 不固定对应某个时长；账户没有返回的窗口保持“未提供”。

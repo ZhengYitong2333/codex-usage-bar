@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 import sqlite3
 import tempfile
@@ -182,6 +183,80 @@ class OpenCodeLoginTests(unittest.TestCase):
             result = opencode_usage.query()
         self.assertEqual(result['limits_status'], 'unavailable')
         self.assertEqual(result['error'], 'HTTP 403')
+
+
+class OpenCodeHistoryTests(unittest.TestCase):
+    now = dt.datetime(2026, 1, 3, 12).timestamp()
+
+    def snapshot(self, days, input_tokens=0, output_tokens=0, cache=0):
+        day = dt.datetime.fromtimestamp(self.now).date() - dt.timedelta(days=days - 1)
+        return {'range': {'from': dt.datetime.combine(day, dt.time()).timestamp() * 1000},
+                'tokens': {'input': input_tokens, 'output': output_tokens,
+                           'reasoning': 0, 'cache': {'read': cache, 'write': 0}}}
+
+    def test_daily_tokens_across_year_boundary_include_cache(self):
+        def stats(binary, days, timeout):
+            return self.snapshot(days, days * 100, days * 20, days * 50)
+        with patch.object(opencode_usage, 'read_stats', side_effect=stats) as read:
+            history = opencode_usage.read_history('/test/opencode', self.now)
+        self.assertEqual(read.call_count, 7)
+        self.assertEqual([day['date'] for day in history],
+                         ['12-28', '12-29', '12-30', '12-31', '01-01', '01-02', '01-03'])
+        self.assertTrue(all(day['tokens'] == 170 for day in history))
+        self.assertEqual(history[-1]['input_tokens'], 100)
+        self.assertEqual(history[-1]['output_tokens'], 20)
+        self.assertEqual(history[-1]['text'], '170')
+
+    def test_empty_usage_has_seven_zero_days(self):
+        with patch.object(opencode_usage, 'read_stats',
+                          side_effect=lambda binary, days, timeout: self.snapshot(days)):
+            history = opencode_usage.read_history('/test/opencode', self.now)
+        self.assertEqual(len(history), 7)
+        self.assertTrue(all(day['tokens'] == 0 for day in history))
+
+    def test_missing_or_wrong_calendar_range_is_not_a_zero_estimate(self):
+        for stats in ({}, self.snapshot(2)):
+            with self.subTest(stats=stats), patch.object(opencode_usage, 'read_stats', return_value=stats):
+                with self.assertRaises(opencode_usage.OpenCodeError):
+                    opencode_usage.read_history('/test/opencode', self.now)
+
+    def test_invalid_tokens_are_rejected(self):
+        for tokens in (None, {'input': '10'}, {'input': -5}, {'cache': 'bad'}):
+            with self.subTest(tokens=tokens), self.assertRaises(opencode_usage.OpenCodeError):
+                opencode_usage.token_counts({'tokens': tokens})
+
+    def test_total_timeout_applies_to_whole_history(self):
+        with patch.object(opencode_usage, 'read_stats') as read:
+            with self.assertRaises(opencode_usage.OpenCodeError):
+                opencode_usage.read_history('/test/opencode', self.now, timeout=0)
+        read.assert_not_called()
+
+    def test_query_daily_failure_preserves_go_quota(self):
+        with patch.object(opencode_usage, 'find_opencode', return_value='/test/opencode'), \
+             patch.object(opencode_usage, 'read_stats', return_value=self.snapshot(7)), \
+             patch.object(opencode_usage, 'usage_limits',
+                          return_value=({'go': {'rolling': {'percent': 25}}}, 'ok')), \
+             patch.object(opencode_usage, 'read_history', side_effect=opencode_usage.OpenCodeError('统计失败')):
+            result = opencode_usage.query()
+        self.assertEqual(result['limits_status'], 'ok')
+        self.assertEqual(result['go_meters'][0]['remaining'], 75)
+        self.assertIsNone(result['stats']['today_text'])
+        self.assertEqual(result['stats']['history'], [])
+        self.assertEqual(result['stats']['error'], '统计失败')
+
+    def test_query_publishes_today_and_history(self):
+        history = [{'date': '01-03', 'tokens': 1234, 'input_tokens': 1000,
+                    'output_tokens': 234, 'text': '1.2k'}]
+        with patch.object(opencode_usage, 'find_opencode', return_value='/test/opencode'), \
+             patch.object(opencode_usage, 'read_stats', return_value=self.snapshot(7)), \
+             patch.object(opencode_usage, 'usage_limits', return_value=({}, 'ok')), \
+             patch.object(opencode_usage, 'read_history', return_value=history) as read:
+            result = opencode_usage.query()
+            self.assertEqual(result['stats']['today_text'], '1.2k')
+            self.assertEqual(result['stats']['history'], history)
+            read.reset_mock()
+            self.assertIsNone(opencode_usage.query(show_stats=False)['stats'])
+            read.assert_not_called()
 
 
 if __name__ == '__main__':

@@ -13,6 +13,10 @@ class QuotaQueryError(Exception):
     """A safe, user-facing error without credentials or raw server output."""
 
 
+class AuthError(QuotaQueryError):
+    """The Codex account is not signed in, so the user has to log in."""
+
+
 def find_codex():
     candidates = [shutil.which('codex'), str(Path.home() / '.local/bin/codex'),
                   '/Applications/Codex.app/Contents/Resources/codex',
@@ -26,7 +30,7 @@ def find_codex():
 def api_error(error):
     message = str(error.get('message', '')).lower()
     if any(word in message for word in ('401', 'unauthorized', 'authentication', 'not logged', 'not authenticated', 'requires chatgpt', 'not available for api key')):
-        return QuotaQueryError('Codex 登录状态不可用，请在 Codex 中重新登录 ChatGPT 账号')
+        return AuthError('Codex 登录状态不可用，请在 Codex 中重新登录 ChatGPT 账号')
     if '429' in message or 'too many requests' in message:
         return QuotaQueryError('额度接口暂时限流，稍后重试')
     if '403' in message or 'forbidden' in message:

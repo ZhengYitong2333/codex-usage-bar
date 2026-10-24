@@ -256,7 +256,7 @@ struct SettingsView: View {
                     Text("剩余百分比").tag("remaining")
                     Text("已用百分比").tag("used")
                 }
-                Picker("统计天数", selection: $store.draft.opencode_days) {
+                Picker("详情统计范围", selection: $store.draft.opencode_days) {
                     Text("近 7 日").tag(7)
                     Text("近 30 日").tag(30)
                 }
@@ -276,9 +276,9 @@ struct SettingsView: View {
             } header: { Text("Go 额度") }
             Section {
                 Toggle("显示本地统计", isOn: $store.draft.opencode_show_stats)
-                Toggle("显示费用", isOn: $store.draft.opencode_show_cost)
+                Toggle("详情中显示费用", isOn: $store.draft.opencode_show_cost)
                     .disabled(!store.draft.opencode_show_stats)
-                Text("统计来自 opencode stats：tokens、费用、会话数和活跃天数。")
+                Text("显示今日本机 tokens 和近 7 日趋势；悬停可查看每日输入、输出，说明中保留费用和会话统计。")
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("本地统计") }
             Section {

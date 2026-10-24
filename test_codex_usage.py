@@ -122,3 +122,13 @@ class UsageTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+    def test_auth_required_is_reported_to_the_app(self):
+        data = {'refreshed_at': 1000, 'latest': None, 'today': {'total_tokens': 0},
+                'skipped_files': 0, 'quota_error': 'Codex 登录状态不可用，请在 Codex 中重新登录 ChatGPT 账号',
+                'auth_required': True}
+        model = ui_model(data)
+        self.assertTrue(model['auth_required'])
+        self.assertIsNone(model['headline'])
+        self.assertFalse(ui_model({'refreshed_at': 1, 'latest': None, 'today': {'total_tokens': 0},
+                                   'skipped_files': 0})['auth_required'])

@@ -100,6 +100,9 @@ def collect_usage(home, local_only=False):
         try:
             data['latest'] = quota_api.query(home)
             data['quota_source'] = 'api'
+        except quota_api.AuthError as error:
+            data['quota_error'] = str(error)
+            data['auth_required'] = True
         except quota_api.QuotaQueryError as error:
             data['quota_error'] = str(error)
         data['queried_at'] = dt.datetime.now().timestamp()
@@ -214,6 +217,7 @@ def ui_model(data, settings=None):
         'history': [],
         'details': [],
         'error': data.get('quota_error'),
+        'auth_required': bool(data.get('auth_required')),
         'source': 'Codex 查询接口' if source == 'api' else '本机日志',
         'updated': local_time(data.get('scanned_at', now)),
         'refresh_minutes': settings['refresh_minutes'],
