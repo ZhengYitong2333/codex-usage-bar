@@ -71,6 +71,7 @@ struct UIModel: Codable, Equatable {
     var showCodex: Bool
     var showOpenCode: Bool
     var icon: Icon?
+    var metrics: [MenuBarMetric]?
 }
 
 struct OpenCodeModel: Codable, Equatable {
@@ -143,6 +144,7 @@ struct OpenCodeModel: Codable, Equatable {
     var stats: Stats?
     var updated: Double?
     var error: String?
+    var metrics: [MenuBarMetric]?
 }
 
 // MARK: - Data loading
@@ -151,33 +153,75 @@ struct OpenCodeModel: Codable, Equatable {
 ///
 /// The card visibility and the refresh interval must not depend on a query
 /// succeeding, so they come from disk rather than from a payload.
+private struct FileStamp: Equatable {
+    var modified: Date?
+    var size: Int?
+    static let none = FileStamp(modified: nil, size: nil)
+}
+
 @MainActor
 final class AppSettings: ObservableObject {
-    @Published private(set) var showCodex = true
-    @Published private(set) var showOpenCode = true
-    @Published private(set) var refreshMinutes = 5
-    @Published private(set) var menuBarItems: [MenuBarMetric] = [.codex]
-    @Published private(set) var opencodeCLIPath = ""
+    @Published private(set) var preferences = Preferences()
+    @Published private(set) var catalog: [MenuBarMetric] = []
+    var showCodex: Bool { preferences.show_codex }
+    var showOpenCode: Bool { preferences.show_opencode }
+    var refreshMinutes: Int { preferences.refresh_minutes }
+    var menuBarItems: [MetricID] { preferences.menu_bar_items }
+    var opencodeCLIPath: String { preferences.opencode_cli }
+    var staleMinutes: Int { preferences.stale_minutes }
+    private let load: () throws -> SettingsPayload
 
-    private let file = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/CodexUsage/settings.json")
+    private let file: URL
+    private var stamp = FileStamp.none
+    private var watcher: Timer?
+    /// Called after the settings file changes on disk.
+    var onChange: (() -> Void)?
 
-    init() {
+    init(file: URL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/CodexUsage/settings.json"),
+         load: @escaping () throws -> SettingsPayload = { try SettingsPayload.load() }) {
+        self.file = file
+        self.load = load
+        stamp = fileStamp()
         reload()
+        // The settings window also posts a distributed notification, but that
+        // can be missed (a suspended app, a different launchd session). Polling
+        // the file is cheap and always correct.
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.reloadIfChanged() }
+        }
+        timer.tolerance = 0.4
+        RunLoop.main.add(timer, forMode: .common)
+        watcher = timer
     }
 
-    func reload() {
-        guard let data = try? Data(contentsOf: file),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-        if let value = object["show_codex"] as? Bool { showCodex = value }
-        if let value = object["show_opencode"] as? Bool { showOpenCode = value }
-        if let value = object["refresh_minutes"] as? Int, value > 0 { refreshMinutes = value }
-        if let path = object["opencode_cli"] as? String { opencodeCLIPath = path }
-        if let items = object["menu_bar_items"] as? [String] {
-            let metrics = items.compactMap(MenuBarMetric.init(rawValue:))
-            if !metrics.isEmpty { menuBarItems = metrics }
+    private func fileStamp() -> FileStamp {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: file.path) else {
+            return .none
         }
+        let modified = attributes[.modificationDate] as? Date
+        let size = (attributes[.size] as? NSNumber)?.intValue
+        return FileStamp(modified: modified, size: size)
     }
+
+    @discardableResult
+    func reloadIfChanged() -> Bool {
+        let current = fileStamp()
+        guard current != stamp else { return false }
+        guard reload() else { return false }
+        stamp = current
+        onChange?()
+        return true
+    }
+
+    @discardableResult
+    private func reload() -> Bool {
+        guard let payload = try? load() else { return false }
+        preferences = payload.settings
+        catalog = payload.metrics
+        return true
+    }
+
 }
 
 @MainActor
@@ -194,8 +238,14 @@ final class UsageStore: ObservableObject {
     private var loadingOpenCode = false
     private let script = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/CodexUsage/codex_usage.py")
-    let settings = AppSettings()
+    let settings: AppSettings
 
+    init(settings: AppSettings? = nil) {
+        self.settings = settings ?? AppSettings()
+        // The settings window writes the file; a missed notification still
+        // reaches the menu bar through this.
+        self.settings.onChange = { [weak self] in self?.refresh() }
+    }
 
     func refresh() {
         onModel?(model)
@@ -299,30 +349,15 @@ final class UsageStore: ObservableObject {
 
 @MainActor
 enum StatusIcon {
-    static func values(metrics: [MenuBarMetric], codex: UIModel?, openCode: OpenCodeModel?,
-                       now: Double = Date().timeIntervalSince1970) -> [MenuBarValue] {
-        metrics.map { metric in
-            let used: Double?
-            let stale: Bool
-            switch metric {
-            case .codex:
-                used = codex?.headline?.used
-                stale = codex?.stale ?? false
-            case .codexPrimary, .codexSecondary:
-                let key = metric == .codexPrimary ? "primary" : "secondary"
-                used = codex?.windows.first { $0.key == key && $0.available }?.used
-                stale = codex?.stale ?? false
-            case .openCodeRolling, .openCodeWeekly, .openCodeMonthly:
-                let key = metric == .openCodeRolling ? "rolling" : metric == .openCodeWeekly ? "weekly" : "monthly"
-                used = (openCode?.menuBarMeters ?? openCode?.goMeters)?.first { $0.key == key }?.used
-                stale = openCode?.updated.map { now - $0 > 900 } ?? false
+    static func values(selected: [MetricID], catalog: [MenuBarMetric], readings: [MenuBarMetric],
+                       staleMinutes: Int, now: Double = Date().timeIntervalSince1970) -> [MenuBarValue] {
+        selected.map { id in
+            let definition = catalog.first { $0.id == id }
+            guard let metric = readings.first(where: { $0.id == id }) ?? definition else {
+                return MenuBarValue(label: id.provider, value: "—", tooltip: "所选指标暂不可用")
             }
-            var reading = metric.reading(used: used, stale: stale)
-            if metric == .codex, let headline = codex?.headline {
-                reading.tooltip = "Codex · \(headline.label)：剩余 \(reading.value)"
-                    + (stale ? "（记录已过时）" : "")
-            }
-            return reading
+            let stale = metric.updated.map { now - $0 > Double(staleMinutes * 60) } ?? false
+            return metric.reading(used: metric.used, display: definition?.display ?? metric.display, stale: stale)
         }
     }
 
@@ -333,11 +368,10 @@ enum StatusIcon {
         let labelAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: NSColor.black, .font: labelFont]
         let valueAttributes: [NSAttributedString.Key: Any] = [.foregroundColor: NSColor.black, .font: valueFont]
         // Measure with the stale marker in place so the item does not resize.
-        let labels = values.map { $0.label + " ·" }
-        let drawn = values.map { $0.stale ? $0.label + " ·" : $0.label }
+        let labels = values.map(\.label)
         let widths = zip(labels, values).map { label, value in
             max(CGFloat(icon?.width ?? 30), ceil(max((label as NSString).size(withAttributes: labelAttributes).width,
-                                                    (value.value as NSString).size(withAttributes: valueAttributes).width)) + 2)
+                                                    ((value.value.hasSuffix("!") ? value.value : value.value + "!") as NSString).size(withAttributes: valueAttributes).width)) + 2)
         }
         let gap: CGFloat = 8
         let width = widths.reduce(0, +) + CGFloat(max(0, values.count - 1)) * gap
@@ -345,13 +379,17 @@ enum StatusIcon {
         image.lockFocus()
         var x: CGFloat = 0
         for index in values.indices {
-            let label = drawn[index]
+            let label = values[index].label
+            let color = NSColor.black.withAlphaComponent(values[index].stale ? 0.55 : 1)
+            var labelStyle = labelAttributes, valueStyle = valueAttributes
+            labelStyle[.foregroundColor] = color
+            valueStyle[.foregroundColor] = color
             let value = values[index].value
             let textWidth = max((label as NSString).size(withAttributes: labelAttributes).width,
                                 (value as NSString).size(withAttributes: valueAttributes).width)
             let left = x + max(0, (widths[index] - textWidth) / 2)
-            (label as NSString).draw(at: NSPoint(x: left, y: 12), withAttributes: labelAttributes)
-            (value as NSString).draw(at: NSPoint(x: left, y: CGFloat(icon?.valueOffset ?? 0)), withAttributes: valueAttributes)
+            (label as NSString).draw(at: NSPoint(x: left, y: 12), withAttributes: labelStyle)
+            (value as NSString).draw(at: NSPoint(x: left, y: CGFloat(icon?.valueOffset ?? 0)), withAttributes: valueStyle)
             x += widths[index] + gap
         }
         image.unlockFocus()
@@ -368,7 +406,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
     private let store = UsageStore()
-    private var refreshTimer: Timer?
+    private(set) var refreshTimer: Timer?
     private var settingsObserver: NSObjectProtocol?
     private var chartPanel: NSPanel?
     private var chartPanelState = ChartPanelState()
@@ -387,7 +425,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.action = #selector(statusItemClicked(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
             button.imagePosition = .imageOnly
-            button.image = StatusIcon.make(values: [MenuBarMetric.codex.reading(used: nil)], icon: nil)
+            button.image = StatusIcon.make(values: [MenuBarValue(label: "用量", value: "—", tooltip: "正在读取额度")], icon: nil)
             button.toolTip = "Codex 额度"
         }
         popover.behavior = .transient
@@ -399,22 +437,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             forName: Notification.Name("local.codexusage.settingsChanged"),
             object: nil,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] notification in
+            let refreshRequested = notification.userInfo?["refresh"] as? Bool == true
             Task { @MainActor in
-                self?.store.settings.reload()
-                self?.store.refresh()
+                guard let self else { return }
+                let changed = self.store.settings.reloadIfChanged()
+                if refreshRequested && !changed { self.store.refresh() }
             }
         }
         store.refresh()
         if CommandLine.arguments.contains("--show-popover") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.togglePopover() }
         }
+        #if DEBUG
         if CommandLine.arguments.contains("--preview") {
             Preview.captureWhenReady(store: store, attempts: 40)
         }
         if CommandLine.arguments.contains("--preview-chart") {
             Preview.captureChartWhenReady(store: store, attempts: 40)
         }
+        #endif
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -425,7 +467,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func apply(_ model: UIModel?) {
-        let values = StatusIcon.values(metrics: store.settings.menuBarItems, codex: model, openCode: store.opencode)
+        let values = StatusIcon.values(selected: store.settings.menuBarItems, catalog: store.settings.catalog,
+                                       readings: (model?.metrics ?? []) + (store.opencode?.metrics ?? []),
+                                       staleMinutes: store.settings.staleMinutes)
         statusItem.button?.image = StatusIcon.make(values: values, icon: model?.icon)
         statusItem.button?.toolTip = values.map(\.tooltip).joined(separator: "\n")
         statusItem.button?.setAccessibilityLabel(values.map(\.label).joined(separator: "、"))
@@ -433,9 +477,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         schedule(minutes: store.settings.refreshMinutes)
     }
 
-    private func schedule(minutes: Int) {
+    func schedule(minutes: Int) {
+        let interval = TimeInterval(max(1, minutes) * 60)
+        guard refreshTimer?.isValid != true || refreshTimer?.timeInterval != interval else { return }
         refreshTimer?.invalidate()
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(max(1, minutes) * 60),
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: interval,
                                             repeats: true) { [weak self] _ in
             Task { @MainActor in self?.store.refresh() }
         }
@@ -601,12 +647,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func refreshNow() { store.refresh() }
 
     @objc private func openUsage() {
-        NSWorkspace.shared.open(URL(string: "https://chatgpt.com/codex/settings/usage")!)
+        AppLinks.openUsage(showCodex: store.settings.showCodex, openCodeURL: store.opencode?.usageUrl)
     }
 
     @objc private func openSettings() {
-        NSWorkspace.shared.open(FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Applications/Codex Usage Settings.app"))
+        AppLinks.openSettings()
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
@@ -629,6 +674,35 @@ struct Hairline: View {
 }
 
 @MainActor
+enum AppLinks {
+    static func usageURL(showCodex: Bool, openCodeURL: String?) -> URL {
+        if showCodex { return URL(string: "https://chatgpt.com/codex/settings/usage")! }
+        if let text = openCodeURL, let url = URL(string: text), ["https", "http"].contains(url.scheme) { return url }
+        return URL(string: "https://opencode.ai/console")!
+    }
+
+    static func openUsage(showCodex: Bool, openCodeURL: String?) {
+        NSWorkspace.shared.open(usageURL(showCodex: showCodex, openCodeURL: openCodeURL))
+    }
+
+    static func settingsURL(beside bundle: URL = Bundle.main.bundleURL) -> URL? {
+        let sibling = bundle.deletingLastPathComponent().appendingPathComponent("Codex Usage Settings.app")
+        return FileManager.default.fileExists(atPath: sibling.path) ? sibling
+            : NSWorkspace.shared.urlForApplication(withBundleIdentifier: "local.codexusage.settings")
+    }
+
+    static func openSettings() {
+        if let url = settingsURL() { NSWorkspace.shared.open(url) }
+        else {
+            let alert = NSAlert()
+            alert.messageText = "未找到设置程序"
+            alert.informativeText = "请将设置程序与菜单栏应用放在同一目录，或重新安装。"
+            alert.runModal()
+        }
+    }
+}
+
+@MainActor
 struct PopoverView: View {
     @ObservedObject var store: UsageStore
     let openID: UUID
@@ -636,6 +710,22 @@ struct PopoverView: View {
     var onHoverChange: ((String, Bool, [UIModel.Day], NSRect) -> Void)?
 
     var body: some View {
+        let maximumHeight = max(120, min(680, (NSScreen.main?.visibleFrame.height ?? 800) - 140))
+        VStack(spacing: 0) {
+            ViewThatFits(in: .vertical) {
+                content.padding(16)
+                ScrollView { content.padding(16) }
+            }
+            .frame(maxHeight: maximumHeight)
+            Hairline()
+            footer.padding(12)
+        }
+        .frame(width: 320)
+        .fixedSize(horizontal: false, vertical: true)
+        .background(VisualEffectView().ignoresSafeArea())
+    }
+
+    @ViewBuilder private var content: some View {
         let showCodex = store.settings.showCodex
         let showOpenCode = store.settings.showOpenCode
         VStack(alignment: .leading, spacing: 12) {
@@ -688,12 +778,7 @@ struct PopoverView: View {
                 OpenCodeCard(store: store, openID: openID, animateBar: animateBar,
                              onHoverChange: onHoverChange)
             }
-            Hairline()
-            footer
         }
-        .padding(16)
-        .frame(width: 320, alignment: .leading)
-        .background(VisualEffectView().ignoresSafeArea())
     }
 
     private var header: some View {
@@ -780,11 +865,10 @@ struct PopoverView: View {
         HStack(spacing: 2) {
             FooterButton(icon: "arrow.clockwise", title: "刷新") { store.refresh() }
             FooterButton(icon: "arrow.up.right.square", title: "用量") {
-                NSWorkspace.shared.open(URL(string: "https://chatgpt.com/codex/settings/usage")!)
+                AppLinks.openUsage(showCodex: store.settings.showCodex, openCodeURL: store.opencode?.usageUrl)
             }
             FooterButton(icon: "gearshape", title: "设置") {
-                NSWorkspace.shared.open(FileManager.default.homeDirectoryForCurrentUser
-                    .appendingPathComponent("Applications/Codex Usage Settings.app"))
+                AppLinks.openSettings()
             }
             FooterButton(icon: "power", title: "退出") { NSApp.terminate(nil) }
         }
@@ -1188,6 +1272,7 @@ struct OpenCodeCard: View {
         let updated = model.updated.map { formatter.string(from: Date(timeIntervalSince1970: $0)) } ?? "—"
         let history = stats.history ?? []
         return UsageSummaryView(tokensText: stats.todayText ?? "—", updated: updated,
+                                stale: model.updated.map { Date().timeIntervalSince1970 - $0 > Double(store.settings.staleMinutes * 60) } ?? false,
                                 history: history, source: "本机统计") { hovering, anchor in
             onHoverChange?(openID.uuidString + "-opencode", hovering, history, anchor)
         }
@@ -1431,7 +1516,6 @@ struct Sparkline: View {
                     .animation(.interpolatingSpring(stiffness: 240, damping: 14)
                         .delay(Double(index) * 0.03),
                         value: animator.shown)
-                    .accessibilityLabel("\(day.date)：\(day.text) tokens")
             }
         }
         .frame(height: 20, alignment: .bottom)
@@ -1493,6 +1577,8 @@ struct VisualEffectView: NSViewRepresentable {
 }
 
 // MARK: - Offscreen preview (development only)
+
+#if DEBUG
 
 @MainActor
 enum Preview {
@@ -1589,8 +1675,17 @@ enum Preview {
     }
 
     static func capture(store: UsageStore) {
-        store.opencode = sampleOpenCode
-        let values = StatusIcon.values(metrics: MenuBarMetric.allQuotas, codex: store.model, openCode: sampleOpenCode)
+        var sample = sampleOpenCode
+        sample.metrics = store.settings.catalog.filter { $0.provider == "opencode" }.map { definition in
+            var metric = definition
+            metric.used = sampleOpenCode.goMeters?.first { $0.key == metric.meter }?.used
+            metric.updated = sampleOpenCode.updated
+            return metric
+        }
+        store.opencode = sample
+        let readings = (store.model?.metrics ?? []) + (sample.metrics ?? [])
+        let values = StatusIcon.values(selected: store.settings.catalog.filter { !$0.automatic }.map(\.id),
+                                       catalog: store.settings.catalog, readings: readings, staleMinutes: store.settings.staleMinutes)
         let icon = StatusIcon.make(values: values, icon: store.model?.icon)
         let canvas = NSImage(size: NSSize(width: icon.size.width + 32, height: 54))
         canvas.lockFocus()
@@ -1625,6 +1720,8 @@ enum Preview {
         }
     }
 }
+
+#endif
 
 // MARK: - Entry point
 

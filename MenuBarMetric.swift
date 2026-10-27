@@ -1,58 +1,45 @@
 import Foundation
 
-enum MenuBarMetric: String, Codable, CaseIterable, Identifiable {
-    case codex
-    case codexPrimary = "codex_primary"
-    case codexSecondary = "codex_secondary"
-    case openCodeRolling = "opencode_rolling"
-    case openCodeWeekly = "opencode_weekly"
-    case openCodeMonthly = "opencode_monthly"
+struct MetricID: Codable, Hashable, Identifiable {
+    var provider: String
+    var meter: String
+    var id: Self { self }
+}
 
-    static let allQuotas: [Self] = [.codexPrimary, .codexSecondary,
-                                  .openCodeRolling, .openCodeWeekly, .openCodeMonthly]
-    var id: String { rawValue }
+struct MenuBarMetric: Codable, Equatable, Identifiable {
+    var provider: String
+    var meter: String
+    var label: String
+    var quotaLabel: String?
+    var shortLabel: String
+    var automatic: Bool
+    var displayKey: String
+    var display: String
+    var used: Double?
+    var updated: Double?
+    var id: MetricID { MetricID(provider: provider, meter: meter) }
 
-    static func selection(_ selected: [Self], metric: Self, enabled: Bool) -> [Self] {
+    static func selection(_ selected: [MetricID], metric: Self, enabled: Bool, catalog: [Self]) -> [MetricID] {
         var items = selected
         if enabled {
-            if metric == .codex {
-                items.removeAll { $0 == .codexPrimary || $0 == .codexSecondary }
-            } else if metric == .codexPrimary || metric == .codexSecondary {
-                items.removeAll { $0 == .codex }
-            }
-            if !items.contains(metric) { items.append(metric) }
+            let automaticIDs = Set(catalog.filter { $0.automatic }.map(\.id))
+            items.removeAll { $0.provider == metric.provider && (metric.automatic || automaticIDs.contains($0)) }
+            if !items.contains(metric.id) { items.append(metric.id) }
         } else if items.count > 1 {
-            items.removeAll { $0 == metric }
+            items.removeAll { $0 == metric.id }
         }
-        return allCases.filter { items.contains($0) }
+        return items
     }
 
-    var label: String {
-        switch self {
-        case .codex: return "Codex 当前主额度（自动）"
-        case .codexPrimary: return "Codex · 5 小时"
-        case .codexSecondary: return "Codex · 每周"
-        case .openCodeRolling: return "OpenCode · 5 小时额度"
-        case .openCodeWeekly: return "OpenCode · 每周"
-        case .openCodeMonthly: return "OpenCode · 每月"
+    func reading(used: Double?, display: String, stale: Bool = false) -> MenuBarValue {
+        let mode = display == "used" ? "已用" : "剩余"
+        let value = used.flatMap { used -> String? in
+            guard used.isFinite else { return nil }
+            let bounded = min(100, max(0, used))
+            return "\(Int((display == "used" ? bounded : 100 - bounded).rounded()))%"
         }
-    }
-
-    var shortLabel: String {
-        switch self {
-        case .codex: return "Codex"
-        case .codexPrimary: return "Codex 5h"
-        case .codexSecondary: return "Codex 周"
-        case .openCodeRolling: return "Go 5H"
-        case .openCodeWeekly: return "OpenCode"
-        case .openCodeMonthly: return "OpenCode"
-        }
-    }
-
-    func reading(used: Double?, stale: Bool = false) -> MenuBarValue {
-        let value = used.flatMap { $0.isFinite ? "\(Int((100 - min(100, max(0, $0))).rounded()))%" : nil }
-        return MenuBarValue(label: shortLabel, value: value ?? "—", stale: stale,
-                            tooltip: label + (value.map { "：剩余 " + $0 } ?? "：暂无数据")
+        return MenuBarValue(label: shortLabel, value: (value ?? "—") + (stale ? "!" : ""), stale: stale,
+                            tooltip: label + (value.map { "：\(mode) " + $0 } ?? "：暂无数据")
                                 + (stale ? "（记录已过时）" : ""))
     }
 }

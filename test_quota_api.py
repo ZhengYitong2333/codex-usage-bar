@@ -63,7 +63,7 @@ class QuotaTests(unittest.TestCase):
         self.assertEqual(model['source'], 'Codex 查询接口')
         self.assertEqual(model['query_enabled'], True)
         windows = {w['label']: w for w in model['windows']}
-        self.assertEqual(windows['5小时额度']['reason'], '接口未提供')
+        self.assertEqual(windows['5 小时额度']['reason'], '接口未提供')
         self.assertNotIn('77%', json.dumps(model, ensure_ascii=False))
 
     def test_failure_labels_fallback_without_rejuvenating_log(self):

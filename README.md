@@ -33,7 +33,7 @@
 | 想调得顺手？ | 原生 SwiftUI 设置，调整刷新周期、显示窗口、字号和提醒。 |
 | 还用 OpenCode？ | Codex 卡片下方堆叠 OpenCode 卡片，展示 Go 的滚动/每周/每月额度与近 7 日统计。 |
 
-菜单栏采用两行紧凑图形：上方为额度标签，下方为剩余百分比；悬停可查看窗口说明。在“设置 → 外观 → 菜单栏显示内容”中可多选 Codex 的 5 小时／每周和 OpenCode 的滚动／每周／每月额度，也可点击“全部显示”并排展示五项。默认沿用 Codex 当前主额度的自动切换；明确选定的窗口暂无数据时显示 `—`，不替换成其他窗口。菜单栏选择与弹层卡片开关独立。
+菜单栏采用两行紧凑图形：上方为额度标签，下方跟随各自“数字含义”显示剩余或已用百分比；悬停可查看窗口说明。在“设置 → 外观 → 菜单栏显示内容”中可多选 Codex 的 5 小时／每周和 OpenCode 的滚动／每周／每月额度，也可点击“全部显示”并排展示五项。默认沿用 Codex 当前主额度的自动切换；明确选定的窗口暂无数据时显示 `—`，不替换成其他窗口。菜单栏选择与弹层卡片开关独立。
 
 ## 快速开始
 
@@ -83,7 +83,7 @@ codex app-server · stdio
 
 **OpenCode** 通过 `opencode stats --json` 读取本地统计。Go/Console 额度优先走 OpenCode 本地服务的 `/api/experimental/usage/limits`；较旧的 OpenCode 没有这个接口，此时直接调用 OpenCode Console 的 `/zen/go/v1/usage` 与 `/api/policies/current-budgets`。
 
-两张卡片共用统计布局：今日 tokens、更新时间、近 7 日 token 趋势及悬停明细。OpenCode 标注“本机统计”，每日用量从 CLI 的自然日累计窗口计算；费用和会话信息保留在说明中。设置里的详情统计范围不改变近 7 日趋势。
+两张卡片共用统计布局：今日 tokens、更新时间、近 7 日 token 趋势及悬停明细。OpenCode 标注“本机统计”，每日用量从 CLI 的自然日累计窗口计算；费用和会话信息保留在说明中。“统计总计范围”影响合计与费用，趋势固定为近 7 日。已完成日期会缓存并用七日总量校验；常规刷新只查询七日合计和今日（30 日总计模式另查一次合计），跨日、CLI 变更或总量不一致时重算历史。关闭本地统计后不再运行 `opencode stats`。
 
 这两种方式都复用 OpenCode 自己的登录状态：本地服务把地址和一次性服务密码写在 `~/.local/state/opencode/service.json`，Console 请求则使用 OpenCode 存储在 `~/.local/share/opencode/opencode.db` 里的账号凭据（Go 读取 `opencode-go`，Console 读取 `opencode`）。Go Key 仅用于 Go 额度查询，不用于 Console 预算接口；查询失败会显示错误，不再误报未登录。凭据只在内存中用于填充请求头，不复制、不落盘、不打印，也不会写进本工具的配置。
 
@@ -97,10 +97,25 @@ codex app-server · stdio
 
 - **常用**：刷新周期、主显示窗口、已用/剩余、今日 tokens、重置倒计时。
 - **外观**：标签字号、数字字号、字重、组件宽度及数字垂直位置，带示例预览。
-- **提醒**：可选低额度提示与记录过时阈值；提示显示在菜单内。
-- **保存**：只修改本机设置，并立即通知菜单栏应用重新查询。
+- **提醒**：可选低额度提示；Codex 与 OpenCode 菜单栏共用记录过时阈值，过时数字追加 `!` 并降低透明度。
+- **保存**：只提交改动的设置，保留文件中的其他字段，并立即通知菜单栏应用重新查询。
 
 设置保存在 `~/Library/Application Support/CodexUsage/settings.json`，不随仓库分发。
+
+菜单栏指标由 Python 的 `metrics.py` 提供，外观页按指标目录生成开关。选择项使用对象格式，例如：
+
+```json
+{
+  "menu_bar_items": [
+    {"provider": "codex", "meter": "auto"},
+    {"provider": "opencode", "meter": "rolling"}
+  ]
+}
+```
+
+旧字符串配置仍可读取，保存或安装时迁移为对象；未知设置和已有的未知指标保留。至少一张卡片、至少一项指标及自动额度与固定窗口互斥统一由 Python 校验。Swift 两个 App 共用 `Preferences.swift`，并通过测试核对设置键和默认值。
+
+Go 区域的开关仅影响弹层，菜单栏指标在“外观”中独立选择。仅显示 OpenCode 时，“用量”按钮打开 OpenCode 页面。设置程序优先从菜单栏 App 的同级目录查找，支持移动安装位置。
 
 ## 隐私与安全
 
@@ -120,9 +135,14 @@ codex app-server · stdio
 python3 -m unittest discover -s . -p 'test_*.py' -v
 python3 script/check_privacy.py
 ./script/build_and_run.sh --build-only
+bash ./script/test_menu_bar.sh
+bash ./script/test_settings.sh
+bash ./script/test_hover.sh
 ```
 
-日常开发可使用 `./script/build_and_run.sh`，它会重新编译、安装运行文件并打开设置程序。Codex 项目的 Run 动作也使用同一入口。可选 `--verify`、`--debug` 和 `--logs`。
+日常开发可使用 `./script/build_and_run.sh`，它会重新编译、安装并打开菜单栏应用。Codex 项目的 Run 动作也使用同一入口。可选 `--verify`、`--debug` 和 `--logs`。
+
+截图和图表预览代码仅在 `DEBUG` 构建中编译；默认安装的发布版本不包含截图写文件或预览后退出的逻辑。
 
 诊断命令在本机输出额度及估算统计，**分享输出前请自行去除个人用量**：
 
@@ -131,6 +151,8 @@ python3 codex_usage.py                     # 终端可读摘要
 python3 codex_usage.py --json              # 原始统计
 python3 codex_usage.py --ui-json           # 菜单栏应用使用的视图模型
 python3 codex_usage.py --opencode-json     # OpenCode 额度与统计
+python3 codex_usage.py --metrics           # 查询两家额度，输出统一指标读数
+python3 codex_usage.py --metrics --catalog # 离线读取指标定义，不查询额度
 python3 codex_usage.py --local-only --json # 只读本机日志
 ```
 
@@ -139,6 +161,8 @@ codex_usage.py         日志统计、接口与视图模型的整合
 opencode_usage.py      OpenCode stats 与 Go/Console 额度读取
 quota_api.py           App Server 初始化、额度读取与归一化
 settings.py           设置校验与持久化
+metrics.py            指标目录、旧配置迁移与额度术语
+Preferences.swift     两个 App 共用的设置类型与读取
 CodexUsageApp.swift    原生菜单栏应用（毛玻璃弹层、动画进度条）
 SettingsApp.swift     原生设置窗口
 install.sh            独立安装入口

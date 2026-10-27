@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 import quota_api
 import settings as preferences
+import metrics
 
 
 def timestamp(value):
@@ -265,7 +266,7 @@ def displayed_window(settings, primary_used, secondary_used):
 
 def ui_model(data, settings=None):
     """Structured view state for the native menu bar app."""
-    settings = preferences.validate(settings or {})
+    settings = preferences.validate(settings or {}, allow_unknown_metrics=True)
     now = data['refreshed_at']
     latest = data.get('latest')
     source = data.get('quota_source', 'log')
@@ -332,13 +333,13 @@ def ui_model(data, settings=None):
         })
         if used is not None:
             model['headline'] = {
-                'label': '5小时额度' if displayed == 'primary' else '本周额度',
+                'label': metrics.FIVE_HOUR if displayed == 'primary' else metrics.WEEKLY,
                 'mode': mode, 'amount': amount, 'used': used, 'remaining': 100 - used,
             }
         if settings['low_quota_warning'] and not stale:
             model['low_quota'] = [label for label, value in (('5 小时', p), ('每周', s))
                                   if value is not None and 100 - value <= settings['low_quota_threshold']]
-        rows = [('primary', '5小时额度', primary, p), ('secondary', '本周额度', secondary, s)]
+        rows = [('primary', metrics.FIVE_HOUR, primary, p), ('secondary', metrics.WEEKLY, secondary, s)]
         rows.sort(key=lambda row: (row[3] is None, row[0] != displayed))
         for key, label, text, value in rows:
             window = limits.get(key)
@@ -364,8 +365,8 @@ def ui_model(data, settings=None):
         details = [f'额度来源：{model["source"]}',
                    f'每 {settings["refresh_minutes"]} 分钟'
                    f'{"查询额度" if query_enabled else "扫描本机日志"}']
-        for key, label, text, value in (('primary', '5小时额度', primary, p),
-                                        ('secondary', '本周额度', secondary, s)):
+        for key, label, text, value in (('primary', metrics.FIVE_HOUR, primary, p),
+                                        ('secondary', metrics.WEEKLY, secondary, s)):
             window = limits.get(key)
             reset = (window or {}).get('resets_at')
             if value is None:
@@ -390,12 +391,13 @@ def ui_model(data, settings=None):
         ]
         if data['skipped_files']:
             model['details'].append(f'无法读取 {data["skipped_files"]} 个日志文件')
+    model['metrics'] = metrics.readings('codex', model, settings, latest.get('timestamp') if latest else None)
     return model
 
 
 def summary(data, settings=None):
     """A plain-text status for the terminal; the app reads --ui-json instead."""
-    settings = preferences.validate(settings or {})
+    settings = preferences.validate(settings or {}, allow_unknown_metrics=True)
     model = ui_model(data, settings)
     lines = [model['title']]
     for window in model['windows']:
@@ -416,39 +418,60 @@ def summary(data, settings=None):
     return '\n'.join(lines)
 
 
+def opencode_model(settings):
+    import opencode_usage
+    try:
+        result = opencode_usage.query(
+            days=settings['opencode_days'], display=settings['opencode_display'],
+            cli=settings['opencode_cli'] or None,
+            show_go=settings['opencode_show_go'],
+            show_rolling=settings['opencode_show_rolling'],
+            show_weekly=settings['opencode_show_weekly'],
+            show_monthly=settings['opencode_show_monthly'],
+            show_stats=settings['opencode_show_stats'],
+            show_cost=settings['opencode_show_cost'])
+    except opencode_usage.OpenCodeError as error:
+        result = opencode_usage.empty(str(error))
+    result['metrics'] = metrics.readings('opencode', result, settings)
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--codex-home', type=Path, default=Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))))
     parser.add_argument('--json', action='store_true')
     parser.add_argument('--get-settings', action='store_true')
+    parser.add_argument('--defaults', action='store_true', help='配合 --get-settings 读取默认设置')
     parser.add_argument('--save-settings', action='store_true')
     parser.add_argument('--ui-json', action='store_true')
     parser.add_argument('--opencode-json', action='store_true')
+    parser.add_argument('--metrics', action='store_true', help='输出菜单栏指标及当前读数')
+    parser.add_argument('--catalog', action='store_true', help='配合 --metrics 只读取指标定义')
     parser.add_argument('--available-windows', action='store_true')
     parser.add_argument('--local-only', action='store_true', help='只读取本机日志，不查询额度接口')
     args = parser.parse_args()
     if args.get_settings:
-        print(json.dumps(preferences.read(), ensure_ascii=False))
+        settings = preferences.validate({} if args.defaults else preferences.read(), allow_unknown_metrics=True)
+        result = {'settings': settings, 'metrics': metrics.catalog(settings)} if args.catalog else settings
+        print(json.dumps(result, ensure_ascii=False))
         return
     if args.save_settings:
         result = preferences.save(json.load(sys.stdin))
         print(json.dumps(result, ensure_ascii=False))
         return
+    if args.metrics and args.catalog:
+        print(json.dumps(metrics.catalog(preferences.read()), ensure_ascii=False))
+        return
     if args.opencode_json:
-        import opencode_usage
-        try:
-            settings = preferences.read()
-            result = opencode_usage.query(
-                days=settings['opencode_days'], display=settings['opencode_display'],
-                cli=settings['opencode_cli'] or None,
-                show_go=settings['opencode_show_go'],
-                show_rolling=settings['opencode_show_rolling'],
-                show_weekly=settings['opencode_show_weekly'],
-                show_monthly=settings['opencode_show_monthly'],
-                show_stats=settings['opencode_show_stats'],
-                show_cost=settings['opencode_show_cost'])
-        except opencode_usage.OpenCodeError as error:
-            result = opencode_usage.empty(str(error))
+        print(json.dumps(opencode_model(preferences.read()), ensure_ascii=False))
+        return
+    if args.metrics:
+        from concurrent.futures import ThreadPoolExecutor
+        settings = preferences.read()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            codex = pool.submit(lambda: ui_model(collect_usage(args.codex_home, local_only=args.local_only), settings))
+            opencode = pool.submit(opencode_model, settings)
+            result = codex.result()['metrics'] + opencode.result()['metrics']
         print(json.dumps(result, ensure_ascii=False))
         return
     if args.available_windows:

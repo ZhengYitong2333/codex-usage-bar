@@ -1,36 +1,9 @@
 import SwiftUI
 import AppKit
 
-struct Preferences: Codable, Equatable {
-    var refresh_minutes = 5
-    var window = "primary"
-    var display = "remaining"
-    var show_tokens = true
-    var show_countdown = true
-    var label_size = 7
-    var value_size = 12
-    var weight = "regular"
-    var width = 30
-    var value_offset = 0
-    var stale_minutes = 15
-    var low_quota_warning = false
-    var low_quota_threshold = 20
-    var show_codex = true
-    var show_opencode = true
-    var opencode_display = "remaining"
-    var opencode_days = 7
-    var opencode_show_go = true
-    var opencode_show_rolling = true
-    var opencode_show_weekly = true
-    var opencode_show_monthly = true
-    var opencode_show_stats = true
-    var opencode_show_cost = true
-    var opencode_cli = ""
-    var menu_bar_items: [MenuBarMetric] = [.codex]
-}
-
 @MainActor final class SettingsStore: ObservableObject {
-    @Published var selectedTab = CommandLine.arguments.contains("--preview") || CommandLine.arguments.contains("--appearance") ? "appearance" : "codex"
+    @Published var selectedTab = CommandLine.arguments.contains("--appearance") ? "appearance" : "codex"
+    @Published var catalog: [MenuBarMetric] = []
     @Published var draft = Preferences()
     @Published var saved = Preferences()
     @Published var busy = false
@@ -38,31 +11,49 @@ struct Preferences: Codable, Equatable {
     @Published private(set) var availabilityKnown = false
     @Published var message = ""
     @Published var failed = false
+    @Published private(set) var settingsLoaded = false
     let support = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CodexUsage")
 
     init() {
-        let url = support.appendingPathComponent("settings.json")
-        if FileManager.default.fileExists(atPath: url.path) {
-            do {
-                let defaults = try JSONSerialization.jsonObject(with: JSONEncoder().encode(Preferences())) as! [String: Any]
-                let stored = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any] ?? [:]
-                let merged = defaults.merging(stored) { _, savedValue in savedValue }
-                draft = try JSONDecoder().decode(Preferences.self, from: JSONSerialization.data(withJSONObject: merged))
-                saved = draft
-            } catch {
-                message = "无法读取设置，当前显示默认值。保存后可恢复。"
-                failed = true
-            }
+        do {
+            let payload = try SettingsPayload.load()
+            draft = payload.settings
+            catalog = payload.metrics
+            saved = draft
+            settingsLoaded = true
+        } catch {
+            message = "无法读取设置，请检查本机安装后重新打开。"
+            failed = true
         }
+        #if DEBUG
         if CommandLine.arguments.contains("--preview") {
-            draft.menu_bar_items = MenuBarMetric.allQuotas
+            selectedTab = "appearance"
+            draft.menu_bar_items = catalog.filter { !$0.automatic }.map(\.id)
             saved = draft
             return
         }
+        #endif
         Task { await refreshAvailability() }
     }
 
+    func restoreDefaults() {
+        do {
+            draft = try SettingsPayload.load(defaults: true).settings
+            draft.useAvailableWindow(availableWindows)
+            windowPickedDuringProbe = false
+            message = "默认值已填入，点击保存以应用"
+            failed = false
+        } catch {
+            message = "无法读取默认设置，请检查本机安装。"
+            failed = true
+        }
+    }
+
     func canSelect(_ window: String) -> Bool { availableWindows.contains(window) }
+
+    func quotaLabel(_ key: String) -> String {
+        catalog.first { $0.meter == key }?.quotaLabel ?? "额度"
+    }
 
     /// Set while the user changes the window, so a late probe does not override it.
     var windowPickedDuringProbe = false
@@ -86,25 +77,34 @@ struct Preferences: Codable, Equatable {
         guard let result else { return }
         availabilityKnown = true
         availableWindows = result
-        guard !result.isEmpty, !result.contains(draft.window) else { return }
+        guard settingsLoaded, !result.isEmpty, !result.contains(draft.window) else { return }
         // The user may have picked a window while this probe was running.
         guard !windowPickedDuringProbe else { return }
-        draft.window = result.contains("primary") ? "primary" : "secondary"
-        message = "所选额度暂无数据，已切换为\(draft.window == "primary" ? "5 小时" : "每周")；请保存"
+        draft.useAvailableWindow(result)
+        message = "所选额度暂无数据，已切换为\(quotaLabel(draft.window))；请保存"
     }
 
     func refresh() {
-        notifyMenuBar()
+        notifyMenuBar(refresh: true)
         message = "已请求查询最新额度；查询结果将在菜单中更新"
     }
 
-    private func notifyMenuBar() {
+    private func notifyMenuBar(refresh: Bool = false) {
         DistributedNotificationCenter.default().post(name: Notification.Name("local.codexusage.settingsChanged"),
-                                                     object: nil)
+                                                     object: nil, userInfo: refresh ? ["refresh": true] : nil)
     }
 
     func save() {
+        guard settingsLoaded else { return }
         let proposed = draft
+        let changes: Data
+        do {
+            changes = try proposed.changes(from: saved)
+        } catch {
+            message = "无法保存设置，请重新打开设置窗口。"
+            failed = true
+            return
+        }
         let script = support.appendingPathComponent("codex_usage.py").path
         busy = true
         message = "正在应用…"
@@ -113,14 +113,14 @@ struct Preferences: Codable, Equatable {
             let errorText: String? = await Task.detached {
                 do {
                     let process = Process()
-                    let input = Pipe(), output = Pipe(), errors = Pipe()
+                    let input = Pipe(), errors = Pipe()
                     process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
                     process.arguments = [script, "--save-settings"]
                     process.standardInput = input
-                    process.standardOutput = output
+                    process.standardOutput = FileHandle.nullDevice
                     process.standardError = errors
                     try process.run()
-                    input.fileHandleForWriting.write(try JSONEncoder().encode(proposed))
+                    input.fileHandleForWriting.write(changes)
                     try input.fileHandleForWriting.close()
                     process.waitUntilExit()
                     if process.terminationStatus != 0 {
@@ -155,16 +155,18 @@ struct SettingsView: View {
                 Text("Codex 与 OpenCode 的菜单栏配置").font(.caption).foregroundStyle(.secondary)
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 10) {
-                        ForEach(store.draft.menu_bar_items) { metric in
-                            let reading = metric.reading(used: 18)
-                            VStack(alignment: .leading, spacing: 0) {
-                                Text(reading.label)
-                                    .font(.system(size: CGFloat(store.draft.label_size), weight: .light))
-                                Text(reading.value)
-                                    .font(.system(size: CGFloat(store.draft.value_size), weight: valueWeight))
-                                    .offset(y: -CGFloat(store.draft.value_offset))
+                        ForEach(store.draft.menu_bar_items) { id in
+                            if let metric = store.catalog.first(where: { $0.id == id }) {
+                                let reading = metric.reading(used: 18, display: store.draft.displayMode(for: metric))
+                                VStack(alignment: .leading, spacing: 0) {
+                                    Text(reading.label)
+                                        .font(.system(size: CGFloat(store.draft.label_size), weight: .light))
+                                    Text(reading.value)
+                                        .font(.system(size: CGFloat(store.draft.value_size), weight: valueWeight))
+                                        .offset(y: -CGFloat(store.draft.value_offset))
+                                }
+                                .frame(minWidth: CGFloat(store.draft.width), minHeight: 22)
                             }
-                            .frame(minWidth: CGFloat(store.draft.width), minHeight: 22)
                         }
                     }
                     .foregroundStyle(.white)
@@ -182,10 +184,10 @@ struct SettingsView: View {
                 appearanceSettings.tabItem { Label("外观", systemImage: "textformat.size") }.tag("appearance")
             }
             .padding(.horizontal, 16)
-            .disabled(store.busy)
+            .disabled(store.busy || !store.settingsLoaded)
             Divider()
             HStack {
-                Button("恢复默认") { store.draft = Preferences(); store.message = "默认值已填入，点击保存以应用" }
+                Button("恢复默认") { store.restoreDefaults() }
                 Spacer()
                 Button("撤销更改") { store.draft = store.saved; store.message = "" }
                     .disabled(store.draft == store.saved)
@@ -193,7 +195,7 @@ struct SettingsView: View {
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
                     .disabled(store.draft == store.saved)
-            }.disabled(store.busy).padding([.horizontal, .top], 20)
+            }.disabled(store.busy || !store.settingsLoaded).padding([.horizontal, .top], 20)
             Text(store.message.isEmpty ? (store.draft == store.saved ? "设置仅保存在这台 Mac 上" : "有未保存的更改") : store.message)
                 .font(.caption).foregroundStyle(store.failed ? Color.red : Color.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 20).padding(.vertical, 12)
@@ -232,17 +234,20 @@ struct SettingsView: View {
                 Picker("当前主额度", selection: Binding(
                     get: { store.draft.window },
                     set: { selected in
-                        if store.canSelect(selected) { store.draft.window = selected }
+                        if store.canSelect(selected) {
+                            store.windowPickedDuringProbe = true
+                            store.draft.window = selected
+                        }
                     }
                 )) {
-                    Text(store.canSelect("primary") ? "5 小时额度" : "5 小时额度（暂无数据）")
-                        .tag("primary").disabled(!store.canSelect("primary"))
-                    Text(store.canSelect("secondary") ? "每周" : "每周（暂无数据）")
-                        .tag("secondary").disabled(!store.canSelect("secondary"))
+                    ForEach(["primary", "secondary"], id: \.self) { key in
+                        Text(store.quotaLabel(key) + (store.canSelect(key) ? "" : "（暂无数据）"))
+                            .tag(key).disabled(!store.canSelect(key))
+                    }
                 }
                 Text(store.availabilityKnown && store.availableWindows.isEmpty
                      ? "当前查询与本机记录均未提供可用额度，暂不能选择。"
-                     : "下拉菜单始终同时显示 5 小时和每周额度；暂无数据的选项不可选择。")
+                     : "下拉菜单同时显示两个额度窗口；暂无数据的选项不可选择。")
                     .font(.caption).foregroundStyle(.secondary)
                 Picker("数字含义", selection: $store.draft.display) {
                     Text("剩余百分比").tag("remaining")
@@ -261,7 +266,7 @@ struct SettingsView: View {
                 Picker("额度记录过时提醒", selection: $store.draft.stale_minutes) {
                     ForEach([15, 30, 60, 120], id: \.self) { minute in Text("超过 \(minute) 分钟").tag(minute) }
                 }
-                Text("低额度提示检查两个窗口，仅在数据未过时时显示；过时以额度记录时间计算。")
+                Text("低额度提示检查两个窗口，仅在数据未过时时显示；过时阈值同时用于 Codex 和 OpenCode 菜单栏指标。")
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("提醒") }
         }.formStyle(.grouped)
@@ -275,7 +280,7 @@ struct SettingsView: View {
                     Text("剩余百分比").tag("remaining")
                     Text("已用百分比").tag("used")
                 }
-                Picker("详情统计范围", selection: $store.draft.opencode_days) {
+                Picker("统计总计范围", selection: $store.draft.opencode_days) {
                     Text("近 7 日").tag(7)
                     Text("近 30 日").tag(30)
                 }
@@ -283,21 +288,21 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("OpenCode 卡片") }
             Section {
-                Toggle("显示 Go 额度", isOn: $store.draft.opencode_show_go)
-                Toggle("5 小时额度", isOn: $store.draft.opencode_show_rolling)
+                Toggle("在弹层显示 Go 额度", isOn: $store.draft.opencode_show_go)
+                Toggle(store.quotaLabel("rolling"), isOn: $store.draft.opencode_show_rolling)
                     .disabled(!store.draft.opencode_show_go)
-                Toggle("每周额度", isOn: $store.draft.opencode_show_weekly)
+                Toggle(store.quotaLabel("weekly"), isOn: $store.draft.opencode_show_weekly)
                     .disabled(!store.draft.opencode_show_go)
-                Toggle("每月额度", isOn: $store.draft.opencode_show_monthly)
+                Toggle(store.quotaLabel("monthly"), isOn: $store.draft.opencode_show_monthly)
                     .disabled(!store.draft.opencode_show_go)
-                Text("Go 额度从 OpenCode 本地服务读取，需要 OpenCode 已登录。")
+                Text("仅影响弹层；菜单栏显示项在“外观”中单独设置。Go 额度需要 OpenCode 已登录。")
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("Go 额度") }
             Section {
                 Toggle("显示本地统计", isOn: $store.draft.opencode_show_stats)
                 Toggle("详情中显示费用", isOn: $store.draft.opencode_show_cost)
                     .disabled(!store.draft.opencode_show_stats)
-                Text("显示今日本机 tokens 和近 7 日趋势；悬停可查看每日输入、输出，说明中保留费用和会话统计。")
+                Text("总计范围影响合计与费用，趋势固定为近 7 日。显示今日本机 tokens；悬停可查看每日输入、输出，说明中保留费用和会话统计。")
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("本地统计") }
             Section {
@@ -310,10 +315,10 @@ struct SettingsView: View {
 
     private func menuBarSelection(_ metric: MenuBarMetric) -> Binding<Bool> {
         Binding(
-            get: { store.draft.menu_bar_items.contains(metric) },
+            get: { store.draft.menu_bar_items.contains(metric.id) },
             set: { enabled in
                 store.draft.menu_bar_items = MenuBarMetric.selection(store.draft.menu_bar_items,
-                                                                     metric: metric, enabled: enabled)
+                                                                     metric: metric, enabled: enabled, catalog: store.catalog)
             }
         )
     }
@@ -341,14 +346,14 @@ struct SettingsView: View {
         Form {
             Section {
                 HStack {
-                    Button("全部显示") { store.draft.menu_bar_items = MenuBarMetric.allQuotas }
-                    Button("仅 Codex 主额度") { store.draft.menu_bar_items = [.codex] }
+                    Button("全部显示") { store.draft.menu_bar_items = store.catalog.filter { !$0.automatic }.map(\.id) }
+                    Button("仅 Codex 主额度") { store.draft.menu_bar_items = store.catalog.filter { $0.provider == "codex" && $0.automatic }.map(\.id) }
                 }
-                ForEach(MenuBarMetric.allCases) { metric in
+                ForEach(store.catalog) { metric in
                     Toggle(metric.label, isOn: menuBarSelection(metric))
-                        .disabled(store.draft.menu_bar_items == [metric])
+                        .disabled(store.draft.menu_bar_items == [metric.id])
                 }
-                Text("可同时勾选 Codex 和 OpenCode，至少保留一项；全部显示时并排展示 5 项剩余额度。暂无数据显示 —，选择与卡片开关独立。")
+                Text("可同时勾选 Codex 和 OpenCode，至少保留一项；全部显示时并排展示固定窗口额度。菜单栏跟随各自的“数字含义”。暂无数据显示 —，选择与卡片开关独立。")
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("菜单栏显示内容") }
                 Section {
@@ -371,6 +376,7 @@ struct SettingsView: View {
         Window("Codex 用量设置", id: "settings") {
             SettingsView().onAppear {
                 NSApp.activate(ignoringOtherApps: true)
+                #if DEBUG
                 if CommandLine.arguments.contains("--preview") {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
                         if let view = NSApp.keyWindow?.contentView,
@@ -390,6 +396,7 @@ struct SettingsView: View {
                         NSApp.terminate(nil)
                     }
                 }
+                #endif
             }
         }.windowResizability(.contentSize)
     }

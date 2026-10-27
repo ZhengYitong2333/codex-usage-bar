@@ -54,8 +54,8 @@ class UsageTests(unittest.TestCase):
             'today': {'total_tokens': 1234}, 'skipped_files': 0, 'quota_source': 'api'}
         text = summary(data)
         self.assertIn('Codex 周余 81%', text)
-        self.assertIn('本周额度', text)
-        self.assertIn('5小时额度', text)
+        self.assertIn('每周额度', text)
+        self.assertIn('5 小时额度', text)
         self.assertIn('Codex 查询接口', text)
 
     def test_reset_countdown(self):
@@ -72,9 +72,9 @@ class UsageTests(unittest.TestCase):
                 'today': {'total_tokens': 0}, 'skipped_files': 0}
         model = ui_model(data)
         self.assertEqual(model['title'], 'Codex 5h余 80%')
-        self.assertEqual(model['headline']['label'], '5小时额度')
+        self.assertEqual(model['headline']['label'], '5 小时额度')
         self.assertEqual(model['headline']['amount'], 80)
-        self.assertEqual(model['windows'][1]['label'], '本周额度')
+        self.assertEqual(model['windows'][1]['label'], '每周额度')
         self.assertEqual(model['windows'][1]['amount'], 51)
         self.assertEqual(ui_model(data, {'window': 'secondary'})['title'], 'Codex 周余 51%')
 
@@ -90,8 +90,8 @@ class UsageTests(unittest.TestCase):
                 event(999, {'primary': {'window_minutes': 10080, 'used_percent': 49, 'resets_at': 9999}, 'secondary': None})]))
             model = ui_model(collect(home, 1000))
             windows = {w['label']: w for w in model['windows']}
-            self.assertEqual(windows['5小时额度']['status'], '未提供')
-            self.assertEqual(windows['本周额度']['amount'], 51)
+            self.assertEqual(windows['5 小时额度']['status'], '未提供')
+            self.assertEqual(windows['每周额度']['amount'], 51)
             self.assertNotIn('20%', json.dumps(model, ensure_ascii=False))
             self.assertEqual(model['title'], 'Codex 周余 51%')
 

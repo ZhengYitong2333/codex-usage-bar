@@ -248,7 +248,7 @@ class OpenCodeHistoryTests(unittest.TestCase):
              patch.object(opencode_usage, 'read_stats', return_value=self.snapshot(7)), \
              patch.object(opencode_usage, 'usage_limits',
                           return_value=({'go': {'rolling': {'percent': 25}}}, 'ok')), \
-             patch.object(opencode_usage, 'read_history', side_effect=opencode_usage.OpenCodeError('统计失败')):
+             patch.object(opencode_usage, 'cached_history', side_effect=opencode_usage.OpenCodeError('统计失败')):
             result = opencode_usage.query()
         self.assertEqual(result['limits_status'], 'ok')
         self.assertEqual(result['go_meters'][0]['remaining'], 75)
@@ -262,7 +262,7 @@ class OpenCodeHistoryTests(unittest.TestCase):
         with patch.object(opencode_usage, 'find_opencode', return_value='/test/opencode'), \
              patch.object(opencode_usage, 'read_stats', return_value=self.snapshot(7)), \
              patch.object(opencode_usage, 'usage_limits', return_value=({}, 'ok')), \
-             patch.object(opencode_usage, 'read_history', return_value=history) as read:
+             patch.object(opencode_usage, 'cached_history', return_value=history) as read:
             result = opencode_usage.query()
             self.assertEqual(result['stats']['today_text'], '1.2k')
             self.assertEqual(result['stats']['history'], history)
@@ -314,3 +314,98 @@ class OpenCodeResilienceTests(unittest.TestCase):
             history = opencode_usage.read_history('/test/opencode', now=now, known=known)
         self.assertNotIn(7, calls)
         self.assertEqual(len(history), 7)
+
+
+class OpenCodeCacheTests(unittest.TestCase):
+    now = OpenCodeHistoryTests.now
+    snapshot = OpenCodeHistoryTests.snapshot
+
+    def test_warm_history_only_reads_today_and_updates_it(self):
+        calls = []
+        current = [0]
+        def read(binary, days=7, timeout=45):
+            calls.append(days)
+            return self.snapshot(days, input_tokens=days * 100 + current[0])
+        with tempfile.TemporaryDirectory() as folder, patch.object(opencode_usage, 'read_stats', side_effect=read):
+            cache = Path(folder) / 'history.json'
+            first = opencode_usage.cached_history('/test/opencode', self.now, read('', 7), cache_file=cache)
+            self.assertEqual(len(calls), 7)
+            calls.clear()
+            current[0] = 25
+            second = opencode_usage.cached_history('/test/opencode', self.now, read('', 7), cache_file=cache)
+            self.assertEqual(calls, [7, 1])
+            self.assertEqual(second[:-1], first[:-1])
+            self.assertEqual(second[-1]['tokens'], first[-1]['tokens'] + 25)
+            self.assertEqual(sum(day['tokens'] for day in second), 725)
+
+    def test_history_rebuilds_when_completed_days_change(self):
+        changed = [False]
+        calls = []
+        def read(binary, days=7, timeout=45):
+            calls.append(days)
+            return self.snapshot(days, input_tokens=days * 100 + (50 if changed[0] and days >= 3 else 0))
+        with tempfile.TemporaryDirectory() as folder, patch.object(opencode_usage, 'read_stats', side_effect=read):
+            cache = Path(folder) / 'history.json'
+            opencode_usage.cached_history('/test/opencode', self.now, read('', 7), cache_file=cache)
+            calls.clear()
+            changed[0] = True
+            history = opencode_usage.cached_history('/test/opencode', self.now, read('', 7), cache_file=cache)
+            self.assertEqual(len(calls), 7)
+            self.assertEqual(history[-3]['tokens'], 150)
+
+    def test_corrupt_cache_and_new_day_are_rebuilt(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(opencode_usage, 'read_stats',
+                side_effect=lambda binary, days, timeout: self.snapshot(days, days * 10)) as read:
+            cache = Path(folder) / 'history.json'
+            for content in ('{bad', '{}', '{"day":"yesterday","history":[]}'):
+                cache.write_text(content)
+                history = opencode_usage.cached_history('/test/opencode', self.now, self.snapshot(7, 70), cache_file=cache)
+                self.assertEqual(len(history), 7)
+                self.assertEqual(read.call_count, 6)
+                read.reset_mock()
+
+    def test_stats_failure_does_not_hide_live_go_quota(self):
+        with patch.object(opencode_usage, 'find_opencode', return_value='/test/opencode'), \
+             patch.object(opencode_usage, 'read_stats', side_effect=opencode_usage.OpenCodeError('统计失败')), \
+             patch.object(opencode_usage, 'usage_limits', return_value=({'go': {'rolling': {'percent': 25}}}, 'ok')):
+            result = opencode_usage.query()
+        self.assertEqual(result['go_meters'][0]['used'], 25)
+        self.assertEqual(result['stats']['error'], '统计失败')
+
+    def test_hidden_stats_skip_all_stats_subprocesses(self):
+        with patch.object(opencode_usage, 'find_opencode', return_value='/test/opencode'), \
+             patch.object(opencode_usage, 'read_stats') as read, \
+             patch.object(opencode_usage, 'usage_limits', return_value=({}, 'ok')):
+            result = opencode_usage.query(show_stats=False)
+        read.assert_not_called()
+        self.assertIsNone(result['stats'])
+
+    def test_thirty_day_total_keeps_seven_day_trend_and_uses_three_warm_calls(self):
+        calls = []
+        def read(binary, days=7, timeout=45):
+            calls.append(days)
+            return self.snapshot(days, input_tokens=days * 100)
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.object(opencode_usage, 'history_cache_path', return_value=Path(folder) / 'history.json'), \
+             patch.object(opencode_usage, 'find_opencode', return_value='/test/opencode'), \
+             patch.object(opencode_usage, 'read_stats', side_effect=read), \
+             patch.object(opencode_usage.time, 'time', return_value=self.now), \
+             patch.object(opencode_usage, 'usage_limits', return_value=({}, 'ok')):
+            opencode_usage.query(days=30)
+            calls.clear()
+            result = opencode_usage.query(days=30)
+            self.assertEqual(calls, [30, 7, 1])
+            self.assertEqual(result['stats']['total'], 3000)
+            self.assertEqual(sum(day['tokens'] for day in result['stats']['history']), 700)
+            self.assertEqual(len(result['stats']['history']), 7)
+
+    def test_midnight_invalidates_completed_day_cache(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(opencode_usage, 'read_stats',
+                side_effect=lambda binary, days, timeout: self.snapshot(days, days * 10)) as read:
+            cache = Path(folder) / 'history.json'
+            opencode_usage.cached_history('/test/opencode', self.now, self.snapshot(7, 70), cache_file=cache)
+            self.now += 86400
+            read.reset_mock()
+            history = opencode_usage.cached_history('/test/opencode', self.now, self.snapshot(7, 70), cache_file=cache)
+            self.assertEqual(read.call_count, 6)
+            self.assertEqual(history[-1]['date'], '01-04')

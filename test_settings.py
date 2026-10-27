@@ -1,9 +1,12 @@
 from pathlib import Path
+import json
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
 import settings
+import metrics
 from codex_usage import ui_model
 
 
@@ -68,22 +71,67 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(ui_model(data, config)['low_quota'], [])
 
     def test_menu_bar_selection_round_trip_and_old_defaults(self):
-        self.assertEqual(settings.validate({})['menu_bar_items'], ['codex'])
+        self.assertEqual(settings.validate({})['menu_bar_items'], [dict(provider='codex', meter='auto')])
         chosen = ['codex_primary', 'codex_secondary', 'opencode_rolling', 'opencode_weekly', 'opencode_monthly']
         with tempfile.TemporaryDirectory() as folder:
             config = Path(folder) / 'settings.json'
             settings.save({'menu_bar_items': chosen, 'show_codex': False}, config)
-            self.assertEqual(settings.read(config)['menu_bar_items'], chosen)
+            self.assertEqual(settings.read(config)['menu_bar_items'], metrics.selection(chosen))
             self.assertFalse(settings.read(config)['show_codex'])
         saved = settings.validate({'menu_bar_items': chosen})
         saved['menu_bar_items'].clear()
         self.assertEqual(len(chosen), 5)
-        self.assertEqual(settings.DEFAULTS['menu_bar_items'], ['codex'])
+        self.assertEqual(settings.DEFAULTS['menu_bar_items'], [dict(provider='codex', meter='auto')])
 
     def test_menu_bar_rejects_empty_unknown_duplicate_and_bad_types(self):
         for items in ([], '', None, ['other'], ['codex', 'codex'], [1], [{}]):
             with self.subTest(items=items), self.assertRaises(ValueError):
                 settings.validate({'menu_bar_items': items})
+
+    def test_cross_field_rules_apply_outside_the_settings_window(self):
+        for raw in ({'show_codex': False, 'show_opencode': False},
+                    {'menu_bar_items': ['codex', 'codex_primary']},
+                    {'menu_bar_items': ['codex_secondary', 'codex']}):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                settings.validate(raw)
+
+    def test_save_patch_preserves_unknown_and_concurrently_changed_fields(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = Path(root) / 'settings.json'
+            config.write_text(json.dumps({'future_setting': {'values': [1, '保留']},
+                                          'display': 'used', 'refresh_minutes': 30}))
+            saved = settings.save({'value_size': 14}, config)
+            self.assertEqual(saved['future_setting'], {'values': [1, '保留']})
+            self.assertEqual(saved['display'], 'used')
+            self.assertEqual(saved['refresh_minutes'], 30)
+            self.assertEqual(saved['value_size'], 14)
+            self.assertEqual(settings.read(config), saved)
+
+    def test_future_metrics_do_not_reset_other_settings_and_survive_edits(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = Path(root) / 'settings.json'
+            config.write_text(json.dumps({'display': 'used', 'menu_bar_items': ['codex', 'future_metric']}))
+            self.assertEqual(settings.read(config)['display'], 'used')
+            saved = settings.save({'value_size': 14}, config)
+            self.assertEqual(saved['menu_bar_items'], metrics.selection(['codex', 'future_metric'], allow_unknown=True))
+            saved = settings.save({'menu_bar_items': ['opencode_weekly']}, config)
+            self.assertEqual(saved['menu_bar_items'], metrics.selection(['opencode_weekly', 'future_metric'], allow_unknown=True))
+            with self.assertRaises(ValueError):
+                settings.save({'menu_bar_items': ['another_unknown']}, config)
+
+    def test_save_does_not_overwrite_an_unreadable_settings_document(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = Path(root) / 'settings.json'
+            for content in ('{broken', '[]'):
+                config.write_text(content)
+                with self.subTest(content=content), self.assertRaises(ValueError):
+                    settings.save({'display': 'used'}, config)
+                self.assertEqual(config.read_text(), content)
+
+    def test_cli_defaults_match_the_settings_authority(self):
+        output = subprocess.check_output(['python3', str(Path(__file__).with_name('codex_usage.py')),
+                                          '--get-settings', '--defaults'])
+        self.assertEqual(json.loads(output), settings.DEFAULTS)
 
 
 if __name__ == '__main__':

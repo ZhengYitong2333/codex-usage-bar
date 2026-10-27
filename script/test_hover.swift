@@ -5,7 +5,7 @@ func hoverLog(_ line: String) {}
 
 @main
 struct HoverTests {
-    @MainActor static func main() {
+    @MainActor static func main() throws {
         var presence = ChartHoverPresence()
         assert(presence.shouldHide)
         presence.rowID = "old-popover-codex"
@@ -40,7 +40,27 @@ struct HoverTests {
         let chart = chartWindow.contentView!
         chartWindow.orderFront(nil)
 
+        let root = URL(fileURLWithPath: CommandLine.arguments[1])
+        let payload = try SettingsPayload.load(script: root.appendingPathComponent("codex_usage.py"), defaults: true)
+        let settings = AppSettings(file: root.appendingPathComponent(".build/unused-settings-stamp"), load: { payload })
+        let store = UsageStore(settings: settings)
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        store.model = try decoder.decode(UIModel.self, from: Data(contentsOf: root.appendingPathComponent(".build/scroll-fixture.json")))
+        store.opencode = Preview.sampleOpenCode
+        let popoverView = NSHostingView(rootView: PopoverView(store: store, openID: UUID(), animateBar: false))
+        let popoverWindow = window(popoverView, size: NSSize(width: 320, height: 720))
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            popoverView.layoutSubtreeIfNeeded()
+            let scrollers = scrollViews(in: popoverView)
+            assert(scrollers.contains { ($0.documentView?.frame.height ?? 0) > $0.contentSize.height })
+            assert(popoverView.fittingSize.height <= 740)
+            assert(popoverView.fittingSize.height > 400)
+            if let bitmap = popoverView.bitmapImageRepForCachingDisplay(in: popoverView.bounds) {
+                popoverView.cacheDisplay(in: popoverView.bounds, to: bitmap)
+                try? bitmap.representation(using: .png, properties: [:])?.write(to: root.appendingPathComponent(".build/popover-scroll.png"))
+            }
             row.layoutSubtreeIfNeeded()
             chart.layoutSubtreeIfNeeded()
             let rows = trackingViews(in: row).filter { $0.debugTag == "row" }
@@ -76,10 +96,16 @@ struct HoverTests {
             assert(exits == [true, false])
             rowWindow.orderOut(nil)
             chartWindow.orderOut(nil)
-            print("Hover checks passed: inactive row, panel, 7 columns, refresh, removal and late exits.")
+            popoverWindow.orderOut(nil)
+            print("Hover and scroll checks passed: long errors, bounded height, inactive row, panel, refresh and late exits.")
             app.terminate(nil)
         }
         app.run()
+    }
+
+    @MainActor static func scrollViews(in view: NSView) -> [NSScrollView] {
+        let own = (view as? NSScrollView).map { [$0] } ?? []
+        return own + view.subviews.flatMap { scrollViews(in: $0) }
     }
 
     @MainActor static func trackingViews(in view: NSView) -> [HoverTrackingView] {

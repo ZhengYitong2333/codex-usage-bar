@@ -5,6 +5,7 @@ $XDG_STATE_HOME/opencode/service.json. Reading that file is the documented
 discovery contract for OpenCode clients. Neither value is logged or persisted.
 """
 import base64
+import hashlib
 import datetime as dt
 import json
 import math
@@ -18,6 +19,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+import metrics
+from settings import SUPPORT, atomic_write
 
 
 class OpenCodeError(Exception):
@@ -310,11 +313,67 @@ def read_history(binary, now, timeout=45, known=None):
         if start is None or dt.datetime.fromtimestamp(start).date() != day:
             raise OpenCodeError('OpenCode 未提供按自然日统计的用量')
         counts = token_counts(stats)
+        if any(counts[key] < previous[key] for key in previous):
+            raise OpenCodeError('OpenCode 累计统计发生变化，请稍后重试')
         entry = {key: max(0, counts[key] - previous[key]) for key in previous}
         entry.update(date=day.strftime('%m-%d'), text=compact(entry['tokens']))
         history.append(entry)
         previous = counts
     return list(reversed(history))
+
+
+def history_cache_path(binary):
+    path = Path(binary).resolve()
+    try:
+        stat = path.stat()
+        version = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        version = None
+    identity = repr((str(path), version, str(Path.cwd()), time.tzname))
+    return SUPPORT / ('opencode-history-' + hashlib.sha256(identity.encode()).hexdigest()[:16] + '.json')
+
+
+def cached_history(binary, now, seven_day_stats, timeout=45, cache_file=None):
+    """Refresh today's counts; reuse completed days while the seven-day total agrees."""
+    cache_file = cache_file or history_cache_path(binary)
+    deadline = time.monotonic() + timeout
+    today_stats = read_stats(binary, days=1, timeout=timeout)
+    # Validate the CLI's natural-day range even when cached days are reusable.
+    today = read_history_day(today_stats, now)
+    start = timestamp((seven_day_stats.get('range') or {}).get('from')) if isinstance(seven_day_stats.get('range'), dict) else None
+    if start is None or dt.datetime.fromtimestamp(start).date() != dt.datetime.fromtimestamp(now).date() - dt.timedelta(days=6):
+        raise OpenCodeError('OpenCode 未提供按自然日统计的用量')
+    counts = token_counts(seven_day_stats)
+    day = dt.datetime.fromtimestamp(now).date().isoformat()
+    try:
+        cached = json.loads(cache_file.read_text())
+        history = cached['history']
+        expected = [(dt.datetime.fromtimestamp(now).date() - dt.timedelta(days=i)).strftime('%m-%d')
+                    for i in range(6, -1, -1)]
+        if (cached['day'] == day and len(history) == 7
+                and [entry['date'] for entry in history] == expected
+                and all(all(number(entry[key]) and entry[key] >= 0 for key in counts) for entry in history)):
+            history[-1] = today
+            if all(sum(entry[key] for entry in history) == value for key, value in counts.items()):
+                return [{**{key: entry[key] for key in counts}, 'date': date, 'text': compact(entry['tokens'])}
+                        for date, entry in zip(expected, history)]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    history = read_history(binary, now, timeout=max(0, deadline-time.monotonic()), known={1: today_stats, 7: seven_day_stats})
+    try:
+        atomic_write(cache_file, json.dumps({'day': day, 'history': history}))
+    except OSError:
+        pass  # A read-only cache must not hide successfully queried usage.
+    return history
+
+
+def read_history_day(stats, now):
+    start = timestamp((stats.get('range') or {}).get('from')) if isinstance(stats.get('range'), dict) else None
+    date = dt.datetime.fromtimestamp(now).date()
+    if start is None or dt.datetime.fromtimestamp(start).date() != date:
+        raise OpenCodeError('OpenCode 未提供按自然日统计的用量')
+    counts = token_counts(stats)
+    return {**counts, 'date': date.strftime('%m-%d'), 'text': compact(counts['tokens'])}
 
 
 def meter(key, label, raw, now, display):
@@ -422,7 +481,7 @@ def normalize(stats, limits, days, display, now,
             result['usage_url'] = workspace.get('usageURL') if isinstance(workspace.get('usageURL'), str) else None
         go = limits.get('go')
         if isinstance(go, dict):
-            labels = (('rolling', '5 小时额度'), ('weekly', '每周额度'), ('monthly', '每月额度'))
+            labels = [(key, metrics.QUOTA_LABELS[key]) for key in ('rolling', 'weekly', 'monthly')]
             meters = {key: meter(key, label, go.get(key), now, display) for key, label in labels}
             result['menu_bar_meters'].extend(m for m in meters.values() if m is not None)
             enabled = {'rolling': show_rolling, 'weekly': show_weekly, 'monthly': show_monthly}
@@ -452,7 +511,11 @@ def query(days=7, display='remaining', timeout=45, cli=None,
             raise OpenCodeError('OpenCode CLI 路径无效')
     else:
         binary = find_opencode()
-    stats = read_stats(binary, days=days, timeout=timeout)
+    stats_error = None
+    try:
+        stats = read_stats(binary, days=days, timeout=timeout) if show_stats else {}
+    except OpenCodeError as exc:
+        stats, stats_error = {}, str(exc)
     now = time.time()
     limits = None
     limits_status = 'unavailable'
@@ -479,8 +542,10 @@ def query(days=7, display='remaining', timeout=45, cli=None,
     result['error'] = error
     if result['stats'] is not None:
         try:
-            known = {days: stats} if days == 7 else None
-            result['stats']['history'] = read_history(binary, now, timeout=timeout, known=known)
+            if stats_error:
+                raise OpenCodeError(stats_error)
+            seven = stats if days == 7 else read_stats(binary, days=7, timeout=timeout)
+            result['stats']['history'] = cached_history(binary, now, seven, timeout=timeout)
             result['stats']['today_text'] = result['stats']['history'][-1]['text']
         except OpenCodeError as exc:
             result['stats']['history'] = []

@@ -22,7 +22,7 @@ fi
 
 support_dir="$HOME/Library/Application Support/CodexUsage"
 mkdir -p "$support_dir" "$HOME/Applications"
-for source in codex_usage.py opencode_usage.py quota_api.py settings.py; do cp "$project_root/$source" "$support_dir/"; done
+for source in codex_usage.py opencode_usage.py quota_api.py settings.py metrics.py; do cp "$project_root/$source" "$support_dir/"; done
 # Remove files the earlier SwiftBar-based versions installed.
 rm -f "$support_dir/codex_action.sh" "$support_dir/codex-usage.5m.sh" "$support_dir/menu_icon"
 
@@ -36,7 +36,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import settings
-settings.save(settings.read())
+settings.save({})
 PY
 
 # Remove this project's legacy SwiftBar plugin so the menu bar does not show twice.

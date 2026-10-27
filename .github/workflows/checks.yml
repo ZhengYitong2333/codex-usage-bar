@@ -18,3 +18,5 @@ jobs:
       - uses: actions/checkout@v4
       - run: ./script/build_and_run.sh --build-only
       - run: bash ./script/test_menu_bar.sh
+      - run: bash ./script/test_settings.sh
+      - run: bash ./script/test_hover.sh
